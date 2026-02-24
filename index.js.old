@@ -1,0 +1,403 @@
+const { default: makeWASocket, useMultiFileAuthState, downloadContentFromMessage } = require("@whiskeysockets/baileys")
+const P = require("pino")
+const qrcode = require("qrcode-terminal")
+const { exec } = require("child_process")
+const fs = require("fs")
+const path = require("path")
+const axios = require("axios")
+const cheerio = require("cheerio")
+const cooldownMap = new Map()
+const userProcessMap = new Map()
+const sharp = require("sharp")
+const puppeteer = require("puppeteer")
+const { Sticker } = require('wa-sticker-formatter')
+
+async function startBot() {
+    const { state, saveCreds } = await useMultiFileAuthState("session")
+
+    const sock = makeWASocket({
+        logger: P({ level: "silent" }),
+        auth: state
+    })
+
+    sock.ev.on("creds.update", saveCreds)
+
+    sock.ev.on("connection.update", (update) => {
+        if (update.qr) qrcode.generate(update.qr, { small: true })
+        if (update.connection === "open") console.log("✅ Bot Connected")
+    })
+
+    sock.ev.on("messages.upsert", async ({ messages }) => {
+        const m = messages[0]
+        if (!m.message) return
+        if (m.key.fromMe) return
+
+        const sender = m.key.remoteJid
+        const isGroup = sender.endsWith("@g.us")
+
+        // =========================
+        // REPLY & REACT HARUS DI ATAS
+        // =========================
+        const reply = async (msg) => {
+            return await sock.sendMessage(sender, { text: msg }, { quoted: m })
+        }
+        const react = async (emoji) => {
+            await sock.sendMessage(sender, {
+                react: { text: emoji, key: m.key }
+            })
+        }
+        // =========================
+        // AMBIL TEXT
+        // =========================
+        const text =
+            m.message.conversation ||
+            m.message.extendedTextMessage?.text ||
+            m.message.imageMessage?.caption ||
+            m.message.videoMessage?.caption ||
+            ""
+        const lowerText = text.trim().toLowerCase()
+        // =========================
+        // PREFIX & COMMAND PARSER
+        // =========================
+        const prefix = "."
+        const isCmd = lowerText.startsWith(prefix)
+
+        const args = isCmd
+            ? lowerText.slice(prefix.length).trim().split(/ +/)
+            : []
+
+        const command = isCmd ? args.shift() : null
+        // =========================
+        // OWNER SYSTEM
+        // =========================
+        const ownerNumber = "6282146731108@s.whatsapp.net"
+        const isOwner =
+            m.key.participant === ownerNumber ||
+            sender === ownerNumber
+        // ==============================
+        // VALIDASI STICKER FORMAT
+        // ==============================
+        const hasImage = !!m.message.imageMessage
+        const hasVideo = !!m.message.videoMessage
+
+        // 1️⃣ Kirim media tapi caption hanya "sticker"
+        if ((hasImage || hasVideo) && lowerText === "sticker") {
+            return reply("⚠️ Gunakan *.sticker* untuk mengubah foto/video menjadi sticker.")
+        }
+
+        // 2️⃣ Kirim .sticker tapi tanpa media
+        if (lowerText === ".sticker" && !hasImage && !hasVideo) {
+            return reply("⚠️ Pilih gambar / video terlebih dahulu.\n\nKirim media dengan caption *.sticker*")
+        }
+
+        // 3️⃣ Kirim sticker tanpa titik & tanpa media
+        if (lowerText === "sticker" && !hasImage && !hasVideo) {
+            return reply("⚠️ Gunakan *.sticker*\n\nKirim gambar / video lalu beri caption *.sticker*")
+        }
+
+        // Kalau bukan command DAN bukan link, hentikan
+        if (text.startsWith(".dl")) {
+        const urlRegex = /(https?:\/\/[^\s]+)/g
+        const match = text.match(urlRegex)
+          if (match) {
+        await sock.sendMessage(sender, {
+            text: "⚠️ Langsung kirimkan link saja tanpa menggunakan *.dl*"
+        }, { quoted: m })
+
+        return
+    }
+        }
+        if (!isCmd && !match) return
+        try {
+
+            // ======================================
+            // STICKER FOTO
+            // ======================================
+
+            if (m.message.imageMessage && text.startsWith(".sticker")) {
+
+                await react("⏳")
+
+                const stream = await downloadContentFromMessage(m.message.imageMessage, "image")
+                let buffer = Buffer.from([])
+                for await (const chunk of stream) {
+                    buffer = Buffer.concat([buffer, chunk])
+                }
+
+                // 🔥 Crop 1:1 FULL (tidak ada hitam)
+                const resizedImage = await sharp(buffer)
+                    .resize(512, 512, {
+                        fit: "contain",
+                        background: { r: 0, g: 0, b: 0, alpha: 0 }
+                    })
+                    .webp({ quality: 95, effort: 6 })
+                    .toBuffer()
+
+                // 🔥 Tambahkan pack name & author
+                const sticker = new Sticker(resizedImage, {
+                    pack: "KepoBot",
+                    author: "Balerina",
+                    type: "full",
+                    quality: 90
+                })
+
+                const stickerBuffer = await sticker.toBuffer()
+
+                await sock.sendMessage(sender, {
+                    sticker: stickerBuffer
+                }, { quoted: m })
+
+                await react("✅")
+            }
+
+            // ======================================
+            // STICKER VIDEO
+            // ======================================
+
+            if (m.message.videoMessage && text.startsWith(".sticker")) {
+
+                await react("⏳")
+
+                const stream = await downloadContentFromMessage(m.message.videoMessage, "video")
+                let buffer = Buffer.from([])
+                for await (const chunk of stream) {
+                    buffer = Buffer.concat([buffer, chunk])
+                }
+
+                const input = `input_${Date.now()}.mp4`
+                const output = `sticker_${Date.now()}.webp`
+
+                fs.writeFileSync(input, buffer)
+
+                exec(`ffmpeg -i ${input} -vf "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000,fps=15" -vcodec libwebp -lossless 0 -q:v 80 -loop 0 -an -vsync 0 -t 8 ${output}`, async () => {
+                    const rawBuffer = fs.readFileSync(output)
+
+                    const sticker = new Sticker(rawBuffer, {
+                        pack: "KepoBot",
+                        author: "Balerina",
+                        type: "full",
+                        quality: 80
+                    })
+
+                    const stickerBuffer = await sticker.toBuffer()
+
+                    await sock.sendMessage(sender, {
+                        sticker: stickerBuffer
+                    }, { quoted: m })
+                    fs.unlinkSync(input)
+                    fs.unlinkSync(output)
+                    await react("✅")
+                })
+            }
+
+            // =============================
+            // DETECT LINK
+            // =============================
+            const urlRegex = /(https?:\/\/[^\s]+)/g
+            const match = text.match(urlRegex)
+
+            if (!match) {
+                if (!isCmd) return
+            }
+
+            const url = match ? match[0] : null
+            const isYoutube = url.includes("youtube.com") || url.includes("youtu.be")
+
+            // =============================
+            // VALIDATION RULES
+            // =============================
+
+            // ❌ YouTube tapi pakai .dl
+            if (isYoutube && text.startsWith(".dl")) {
+                return reply("⚠️ Link YouTube harus gunakan:\n\n🎥 .ytv untuk video\n🎵 .yta untuk audio")
+            }
+
+            // ❌ Non YouTube tapi pakai .ytv/.yta
+            if (!isYoutube && (text.startsWith(".ytv") || text.startsWith(".yta"))) {
+                return reply("⚠️ Command .ytv / .yta hanya untuk YouTube.\n\nGunakan .dl untuk link ini.")
+            }
+
+            // =============================
+            // YOUTUBE VIDEO
+            // =============================
+            if (isYoutube && text.startsWith(".ytv")) {
+
+                await react("⏳")
+
+                const output = `ytvideo_${Date.now()}.mp4`
+
+                exec(`yt-dlp -f best --merge-output-format mp4 -o "${output}" "${url}"`,
+                    async (err) => {
+
+                        if (err) {
+                            await react("❌")
+                            return reply("❌ Gagal download video.")
+                        }
+
+                        if (!fs.existsSync(output)) {
+                            await react("❌")
+                            return reply("❌ File tidak ditemukan.")
+                        }
+
+                        try {
+
+                            const stats = fs.statSync(output)
+                            const sizeMB = stats.size / (1024 * 1024)
+
+                            const buffer = fs.readFileSync(output)
+
+                            if (sizeMB > 30) {
+
+                                await sock.sendMessage(sender, {
+                                    document: buffer,
+                                    mimetype: "video/mp4",
+                                    fileName: "video.mp4"
+                                }, { quoted: m })
+
+                            } else {
+
+                                await sock.sendMessage(sender, {
+                                    video: buffer
+                                }, { quoted: m })
+                            }
+
+                            await react("✅")
+
+                        } catch (e) {
+                            await react("❌")
+                            return reply("❌ Gagal mengirim video.")
+                        }
+
+                        fs.unlinkSync(output)
+                    })
+            }
+
+            // =============================
+            // YOUTUBE AUDIO
+            // =============================
+            else if (isYoutube && text.startsWith(".yta")) {
+
+                await react("⏳")
+                const output = `ytaudio_${Date.now()}.mp3`
+
+                exec(`yt-dlp -x --audio-format mp3 "${url}" -o ${output}`, async () => {
+                    await sock.sendMessage(sender, {
+                        audio: fs.readFileSync(output),
+                        mimetype: "audio/mp4"
+                    }, { quoted: m })
+
+                    fs.unlinkSync(output)
+                    await react("✅")
+                })
+            }
+            // =============================
+// AUTO UNIVERSAL DOWNLOAD FINAL
+// =============================
+else if (match) {
+
+    const { execSync } = require("child_process")
+    const url = match[0]
+
+    await react("⏳")
+
+    try {
+
+        // ===== Ambil metadata JSON
+        const infoRaw = execSync(`yt-dlp --dump-json "${url}"`).toString()
+        const info = JSON.parse(infoRaw)
+
+        const captionText =
+            info.description ||
+            info.title ||
+            "Berhasil download ✅"
+
+        // ===== Jika ada multiple entries (carousel / playlist)
+        const entries = info.entries || [info]
+
+        for (let item of entries) {
+
+            // ===== Jika VIDEO
+            if (item.ext === "mp4" || item.vcodec !== "none") {
+
+                const output = `media_${Date.now()}.mp4`
+
+                execSync(
+                    `yt-dlp -f "bv*+ba/b" \
+                    --no-playlist \
+                    -o "${output}" "${item.webpage_url || url}"`
+                )
+
+                const stats = fs.statSync(output)
+                const sizeMB = stats.size / (1024 * 1024)
+
+                if (sizeMB <= 30) {
+
+                    await sock.sendMessage(sender, {
+                        video: { url: path.resolve(output) },
+                        mimetype: "video/mp4",
+                        caption: captionText
+                    }, { quoted: m })
+
+                } else {
+
+                    await sock.sendMessage(sender, {
+                        document: { url: path.resolve(output) },
+                        mimetype: "video/mp4",
+                        fileName: output,
+                        caption: captionText
+                    }, { quoted: m })
+                }
+
+                fs.unlinkSync(output)
+            }
+
+            // ===== Jika FOTO
+            else if (item.url) {
+
+                const response = await axios.get(item.url, {
+                    responseType: "arraybuffer"
+                })
+
+                await sock.sendMessage(sender, {
+                    image: Buffer.from(response.data),
+                    caption: captionText
+                }, { quoted: m })
+            }
+        }
+
+        await react("✅")
+
+    } catch (err) {
+        console.error("UNIVERSAL DOWNLOAD ERROR:", err)
+        await react("❌")
+        reply("Gagal download media!")
+    }
+}
+        } catch (e) {
+            console.error(e)
+            await react("❌")
+            return reply("⚠️ Terjadi kesalahan. Coba lagi nanti.")
+        }
+    })
+}
+async function downloadInstagramImage(url) {
+    const axios = require("axios")
+    const cheerio = require("cheerio")
+
+    const { data } = await axios.get(url, {
+        headers: {
+            "User-Agent": "Mozilla/5.0"
+        }
+    })
+
+    const $ = cheerio.load(data)
+
+    const imageUrl = $('meta[property="og:image"]').attr("content")
+    const description = $('meta[property="og:description"]').attr("content")
+
+    return {
+        imageUrl,
+        caption: description || ""
+    }
+}
+startBot()
