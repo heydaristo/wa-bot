@@ -1,93 +1,104 @@
-const { default: makeWASocket, useMultiFileAuthState, downloadContentFromMessage } = require("@whiskeysockets/baileys")
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    downloadContentFromMessage,
+    Browsers,
+    fetchLatestBaileysVersion
+} = require("@whiskeysockets/baileys");
 const P = require("pino")
 const qrcode = require("qrcode-terminal")
 const { exec, execSync } = require("child_process")
 const fs = require("fs")
 const path = require("path")
 const { buildStickerSvg } = require("./utils/stickerText")
-const { stickerToImage } = require("./utils/stickerToImage")
+const { stickerWebpToImage } = require("./utils/stickerToImage")
+const { spawn } = require("child_process")
+const pino = require("pino");
+
 const sharp = require("sharp")
 const puppeteer = require("puppeteer")
 const os = require("os")
 
 const { Sticker } = require("wa-sticker-formatter")
 
+// untuk mirror bot
+const MIRROR_DIR = '/var/www/mirror'
+const DOMAIN = 'https://mirror.heydaristo.my.id'
+// ===== MIRROR QUEUE =====
+const mirrorQueue = []
+let isDownloading = false
+// ===== QUEUE CONTROL =====
+let isPaused = false
+// ===== DELETE CONFIRM STATE =====
+let pendingDelete = null
+let pendingClear = null
+
+async function editMessage(sock, jid, key, text) {
+    return sock.sendMessage(jid, {
+        text,
+        edit: key
+    })
+}
 async function startBot() {
 
-    const { state, saveCreds } = await useMultiFileAuthState("session")
 
+    const { state, saveCreds } = await useMultiFileAuthState("auth_info_baileys");
+
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(
+        `Using WhatsApp Web version: ${version.join(".")} | isLatest: ${isLatest}`
+    );
     const sock = makeWASocket({
-        logger: P({ level: "silent" }),
-        auth: state
-    })
-    // bio run time bot
-    const BOT_START_TIME = Date.now()
-    function formatUptime(ms) {
-        const s = Math.floor(ms / 1000)
-        const d = Math.floor(s / 86400)
-        const h = Math.floor((s % 86400) / 3600)
-        const m = Math.floor((s % 3600) / 60)
-        const sec = s % 60
-        return `${d}d ${h}h ${m}m ${sec}s`
-    }
+        version,
+        auth: state,
+        logger: pino({ level: "silent" }),
+        browser: Browsers.macOS("Desktop"),
+        syncFullHistory: false
+    });
     sock.ev.on("creds.update", saveCreds)
 
     sock.ev.on("connection.update", (update) => {
+        const { connection, lastDisconnect, qr } = update;
 
-        if (update.qr) qrcode.generate(update.qr, { small: true })
-        if (update.connection === "open") console.log("✅ Bot Connected")
-        const { connection } = update
+        if (qr) {
+            console.log("📱 Scan QR:");
+            qrcode.generate(qr, { small: true });
+        }
 
         if (connection === "open") {
-            updateBotBio(sock)
+            console.log("✅ WhatsApp CONNECTED");
         }
 
         if (connection === "close") {
-            sock.updateProfileStatus("🔴 KepoBot | OFFLINE")
+            const reason = lastDisconnect?.error?.output?.statusCode;
+            if (reason !== DisconnectReason.loggedOut) {
+                console.log("🔄 Reconnecting...");
+                startBot();
+            } else {
+                console.log("🚫 Logged out. Hapus auth_info_baileys lalu scan ulang.");
+            }
         }
-    })
-    // Bio otomatis dengan stats (RAM + CPU)
-    function getSystemStats() {
-        const usedRam = process.memoryUsage().rss / 1024 / 1024
-        const totalRam = os.totalmem() / 1024 / 1024
-        const ramPercent = (usedRam / totalRam) * 100
-
-        const cpuLoad = os.loadavg()[0] // 1 menit
-
-        return {
-            ram: `${usedRam.toFixed(0)}MB`,
-            ramPercent: ramPercent.toFixed(0),
-            cpu: cpuLoad.toFixed(2)
-        }
-    }
-    function getWIBTime() {
-        return new Date().toLocaleTimeString("id-ID", {
-            timeZone: "Asia/Jakarta",
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit"
-        })
-    }
-    async function updateBotBio(sock) {
-        try {
-            const uptime = formatUptime(Date.now() - BOT_START_TIME)
-            const stats = getSystemStats()
-            const wib = getWIBTime()
-
-            const bio =
-                `🤖 KepoBot | ONLINE
-⏱️ ${uptime} • 📊 ${stats.ram}/${stats.cpu} • 🕒 ${wib}`
-            await sock.updateProfileStatus(bio)
-        } catch (err) {
-            console.error("Gagal update bio:", err)
-        }
-    }
-    setInterval(() => {
-        if (sock?.user) updateBotBio(sock)
-    }, 5 * 60 * 1000) // tiap 5 menit
-    // Handler utama untuk semua pesan masuk
+    });
     sock.ev.on("messages.upsert", async ({ messages }) => {
         try {
+            const fs = require("fs")
+
+            function autoDelete(filePath, hours = 24) {
+                const fs = require("fs")
+
+                const delay = hours * 60 * 60 * 1000 // 24 jam
+
+                setTimeout(() => {
+                    fs.unlink(filePath, err => {
+                        if (err) {
+                            console.error("[AUTO DELETE] Gagal:", err.message)
+                        } else {
+                            console.log("[AUTO DELETE] File dihapus:", filePath)
+                        }
+                    })
+                }, delay)
+            }
 
             if (!messages || !messages[0]) return
             const m = messages[0]
@@ -119,14 +130,14 @@ async function startBot() {
                     react: { text: emoji, key: m.key }
                 })
 
-           const msg = m.message || {}
+            const msg = m.message || {}
 
-const text =
-    msg?.conversation ||
-    msg?.extendedTextMessage?.text ||
-    msg?.imageMessage?.caption ||
-    msg?.videoMessage?.caption ||
-    ""
+            const text =
+                msg?.conversation ||
+                msg?.extendedTextMessage?.text ||
+                msg?.imageMessage?.caption ||
+                msg?.videoMessage?.caption ||
+                ""
 
             const args = text.trim().split(/\s+/)
             const command = args[0]?.toLowerCase() || ""
@@ -202,8 +213,520 @@ const text =
             const isYoutube = url
                 ? (url.includes("youtube.com") || url.includes("youtu.be"))
                 : false
+            function detectSource(url) {
+                if (/drive\.google\.com|drive\.usercontent\.google\.com/.test(url)) {
+                    return "gdrive"
+                }
+                if (/pixeldrain\.com/.test(url)) {
+                    return "pixeldrain"
+                }
+                return "direct"
+            }
+            function detectSource(url) {
+                if (/drive\.google\.com|drive\.usercontent\.google\.com/.test(url)) {
+                    return "gdrive"
+                }
+                if (/pixeldrain\.com/.test(url)) {
+                    return "pixeldrain"
+                }
+                return "direct"
+            }
+            function normalizeDriveUrl(url) {
+                // drive.usercontent.google.com → drive.google.com/uc
+                if (url.includes("drive.usercontent.google.com")) {
+                    const u = new URL(url)
+                    const id = u.searchParams.get("id")
+                    if (id) return `https://drive.google.com/uc?id=${id}`
+                }
 
+                // drive.google.com/file/d/ID/view → uc?id=ID
+                const match = url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/)
+                if (match) {
+                    return `https://drive.google.com/uc?id=${match[1]}`
+                }
 
+                return url
+            }
+            function parseAriaProgress(line) {
+                // contoh:
+                // [#1f3a 45MiB/100MiB(45%) CN:1 DL:3.2MiB ETA:17s]
+                const percent = line.match(/(\d+)%/)
+                const speed = line.match(/DL:([\d.]+[KMG]iB)/)
+                const eta = line.match(/ETA:([0-9a-zA-Z]+)/)
+
+                return percent ? {
+                    percent: percent[1],
+                    speed: speed ? speed[1] : "-",
+                    eta: eta ? eta[1] : "-"
+                } : null
+            }
+            function parseGdownProgress(line) {
+                const m = line.match(/(\d+)%/)
+                return m ? m[1] : null
+            }
+            function progressBar(p) {
+                const total = 10
+                const filled = Math.round((p / 100) * total)
+                return "█".repeat(filled) + "░".repeat(total - filled)
+            }
+            function extractHttpUrl(text) {
+                const match = text.match(/https?:\/\/[^\s]+/i)
+                return match ? match[0] : null
+            }
+            function formatRemaining(ms) {
+                const h = Math.floor(ms / (1000 * 60 * 60))
+                const m = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60))
+                return `${h} jam ${m} menit`
+            }
+            function getExpireInfo(filePath, hours = 24) {
+                const fs = require("fs")
+                if (!fs.existsSync(filePath)) return null
+
+                const stat = fs.statSync(filePath)
+                const expireAt = stat.mtimeMs + hours * 60 * 60 * 1000
+                const remain = expireAt - Date.now()
+
+                if (remain <= 0) return { expired: true }
+
+                return {
+                    expired: false,
+                    remain,
+                    expireAt
+                }
+            }
+            // =======================
+            // Bot Mirror Link
+            // =======================
+            if (command === ".mirror" || command === ".m") {
+
+                if (!args.length) {
+                    return reply("⚠️ Format:\n.mirror <link | list | info>")
+                }
+
+                const fs = require("fs")
+                const path = require("path")
+
+                const sub = args[1]?.toLowerCase() || ""
+                const rawInput = args.slice(1).join(" ").trim()
+
+                // ======================
+                // 📂 LIST
+                // ======================
+                // ======================
+                // 🧹 CLEAR ALL MIRROR
+                // ======================
+                if (sub === "clear") {
+
+                    // if (!isOwner) {
+                    //     return reply("❌ Owner only")
+                    // }
+
+                    if (isDownloading) {
+                        return reply("⛔ Tidak bisa clear saat download sedang berlangsung.")
+                    }
+
+                    const files = fs.readdirSync(MIRROR_DIR)
+                        .filter(f => fs.statSync(path.join(MIRROR_DIR, f)).isFile())
+
+                    if (!files.length) {
+                        return reply("📂 Tidak ada file mirror untuk dihapus.")
+                    }
+
+                    // bersihkan confirm lama
+                    if (pendingClear?.timer) {
+                        clearTimeout(pendingClear.timer)
+                    }
+
+                    // auto expire 30 detik
+                    const timer = setTimeout(() => {
+                        pendingClear = null
+                    }, 30_000)
+
+                    pendingClear = {
+                        sender,
+                        count: files.length,
+                        timer
+                    }
+
+                    return reply(
+                        `⚠️ *KONFIRMASI CLEAR MIRROR*\n\n` +
+                        `📂 Total file: *${files.length}*\n\n` +
+                        `Ketik:\n` +
+                        `• *.m yes* → hapus semua\n` +
+                        `• *.m no* → batal`
+                    )
+                }
+                if (sub === "list") {
+
+                    const files = fs.readdirSync(MIRROR_DIR)
+                        .filter(f => fs.statSync(path.join(MIRROR_DIR, f)).isFile())
+
+                    if (!files.length) {
+                        return reply("📂 Tidak ada file mirror.")
+                    }
+
+                    let text = "📂 *Daftar File Mirror*\n\n"
+
+                    files.forEach((file, i) => {
+                        const info = getExpireInfo(path.join(MIRROR_DIR, file))
+                        if (!info || info.expired) return
+                        text += `${i + 1}. 📄 ${file}\n⏳ ${formatRemaining(info.remain)}\n\n`
+                    })
+
+                    return reply(text.trim())
+                }
+                // ======================
+                // ℹ️ INFO <kata>
+                // ======================
+                if (sub.startsWith("info")) {
+                    const keyword = args.slice(2).join(" ").trim()
+
+                    if (!keyword) {
+                        return reply("⚠️ Contoh:\n.mirror info img\n.mirror info ota")
+                    }
+
+                    const files = fs.readdirSync(MIRROR_DIR)
+                        .filter(f => f.toLowerCase().includes(keyword))
+
+                    if (!files.length) {
+                        return reply("❌ File tidak ditemukan.")
+                    }
+
+                    const file = files[0]
+                    const info = getExpireInfo(path.join(MIRROR_DIR, file))
+
+                    if (!info || info.expired) {
+                        return reply("⛔ File sudah expired / akan dihapus.")
+                    }
+
+                    const expireTime = new Date(info.expireAt).toLocaleString("id-ID", {
+                        timeZone: "Asia/Jakarta"
+                    })
+
+                    return reply(
+                        `📄 *File:* ${file}
+
+⏳ *Sisa waktu:* ${formatRemaining(info.remain)}
+🕒 *Expired:* ${expireTime}`
+                    )
+                }
+                // ======================
+                // 🗑️ DELETE (CONFIRM + OWNER)
+                // ======================
+                if (sub === "delete" || sub === "del") {
+
+                    // if (!isOwner) {
+                    //     return reply("❌ Owner only")
+                    // }
+                    // ⛔ BLOCK SAAT DOWNLOAD AKTIF
+                    if (isDownloading) {
+                        return reply("⛔ Tidak bisa menghapus file saat download sedang berlangsung.")
+                    }
+
+                    const target = args[2]
+                    if (!target) {
+                        return reply("⚠️ Contoh:\n.m delete 1\n.m delete test.txt")
+                    }
+
+                    const files = fs.readdirSync(MIRROR_DIR)
+                        .filter(f => fs.statSync(path.join(MIRROR_DIR, f)).isFile())
+
+                    if (!files.length) {
+                        return reply("📂 Tidak ada file.")
+                    }
+
+                    let file = null
+                    let index = null
+
+                    // 🔢 by nomor
+                    if (/^\d+$/.test(target)) {
+                        index = parseInt(target) - 1
+                        if (index < 0 || index >= files.length) {
+                            return reply("❌ Nomor tidak valid.")
+                        }
+                        file = files[index]
+                    }
+                    // 🔤 by nama
+                    else {
+                        file = files.find(f =>
+                            f.toLowerCase().includes(target.toLowerCase())
+                        )
+                        index = files.indexOf(file)
+                    }
+
+                    if (!file) {
+                        return reply("❌ File tidak ditemukan.")
+                    }
+                    // 🧹 bersihin confirm lama
+                    if (pendingDelete?.timer) {
+                        clearTimeout(pendingDelete.timer)
+                    }
+
+                    // ⏱️ AUTO EXPIRE 30 DETIK
+                    const timer = setTimeout(() => {
+                        pendingDelete = null
+                    }, 30_000)
+
+                    // simpan state confirm
+                    pendingDelete = {
+                        sender,
+                        file,
+                        index
+                    }
+
+                    return reply(
+                        `⚠️ *Konfirmasi Hapus File*\n\n` +
+                        `${index + 1}. 📄 ${file}\n\n` +
+                        `Ketik:\n` +
+                        `• *.m yes* → lanjut\n` +
+                        `• *.m no* → batal`
+                    )
+                }
+                // ======================
+                // ✅ CONFIRM DELETE
+                // ======================
+                if (sub === "yes") {
+
+                    // if (!isOwner) {
+                    //     return reply("❌ Owner only")
+                    // }
+
+                    // ======================
+                    // ✅ CONFIRM CLEAR
+                    // ======================
+                    if (pendingClear && pendingClear.sender === sender) {
+
+                        clearTimeout(pendingClear.timer)
+
+                        const files = fs.readdirSync(MIRROR_DIR)
+                            .filter(f => fs.statSync(path.join(MIRROR_DIR, f)).isFile())
+
+                        for (const f of files) {
+                            try {
+                                fs.unlinkSync(path.join(MIRROR_DIR, f))
+                            } catch (e) {
+                                console.error("[CLEAR ERROR]", e.message)
+                            }
+                        }
+
+                        const total = pendingClear.count
+                        pendingClear = null
+
+                        return reply(
+                            `🧹 *Mirror berhasil dibersihkan*\n\n` +
+                            `🗑️ ${total} file dihapus`
+                        )
+                    }
+
+                    // ======================
+                    // ✅ CONFIRM DELETE (SATU FILE)
+                    // ======================
+                    if (pendingDelete && pendingDelete.sender === sender) {
+
+                        clearTimeout(pendingDelete.timer)
+
+                        const filePath = path.join(MIRROR_DIR, pendingDelete.file)
+                        if (fs.existsSync(filePath)) {
+                            fs.unlinkSync(filePath)
+                        }
+
+                        pendingDelete = null
+                        return reply("🗑️ File berhasil dihapus.")
+                    }
+
+                    return reply("❌ Tidak ada aksi yang menunggu konfirmasi.")
+                }
+                // ======================
+                // ❌ CANCEL DELETE
+                // ======================
+                if (sub === "no") {
+
+                    // if (!isOwner) {
+                    //     return reply("❌ Owner only")
+                    // }
+
+                    if (pendingDelete?.timer) clearTimeout(pendingDelete.timer)
+                    if (pendingClear?.timer) clearTimeout(pendingClear.timer)
+
+                    pendingDelete = null
+                    pendingClear = null
+
+                    return reply("❌ Aksi dibatalkan.")
+                }
+                // ======================
+                // 🔗 LINK MIRROR (URL)
+                // ======================
+                const url = extractHttpUrl(rawInput)
+
+                if (!url) {
+                    return reply("❌ Link tidak valid. Gunakan http/https.")
+                }
+
+                const source = detectSource(url)
+
+                mirrorQueue.push({
+                    url,
+                    sender,
+                    m,
+                    source
+                })
+
+                reply(
+                    `📌 Link masuk antrian!
+📥 Posisi: ${mirrorQueue.length}
+🔗 Sumber: ${source}`
+                )
+
+                processQueue(sock)
+            }
+            async function processQueue(sock) {
+                if (isDownloading || isPaused) return
+                if (!mirrorQueue.length) return
+
+                isDownloading = true
+                const job = mirrorQueue.shift()
+                const { url, sender, m, source } = job
+
+                const jobId = Date.now().toString()
+                const jobDir = path.join(MIRROR_DIR, `job_${jobId}`)
+                fs.mkdirSync(jobDir, { recursive: true })
+
+                // 📩 kirim pesan progress awal
+                const progressMsg = await sock.sendMessage(
+                    sender,
+                    { text: "📥 *Mulai download...*\n0%" },
+                    { quoted: m }
+                )
+
+                const progressKey = progressMsg.key
+                let lastProgress = -1
+                let proc
+
+                // ======================
+                // 📦 GOOGLE DRIVE
+                // ======================
+                if (source === "gdrive") {
+                    const driveUrl = normalizeDriveUrl(url)
+                    console.log("[GDRIVE] URL:", driveUrl)
+
+                    proc = spawn("gdown", ["--fuzzy", driveUrl], { cwd: jobDir })
+
+                    proc.stderr.on("data", async d => {
+                        const line = d.toString()
+                        const p = parseGdownProgress(line)
+
+                        if (p && p !== lastProgress) {
+                            lastProgress = p
+                            const bar = progressBar(p)
+
+                            await editMessage(
+                                sock,
+                                sender,
+                                progressKey,
+                                `📥 *Downloading (Google Drive)*
+
+[${bar}] ${p}%
+
+⚠️ ETA tidak tersedia`
+                            ).catch(() => { })
+                        }
+                    })
+
+                    proc.stderr.on("data", d => {
+                        console.error("[GDOWN]", d.toString().trim())
+                    })
+                }
+
+                // ======================
+                // 🌐 DIRECT / ARIA2
+                // ======================
+                else {
+                    proc = spawn("aria2c", [
+                        "--user-agent=Mozilla/5.0",
+                        "--summary-interval=1",
+                        "--file-allocation=trunc",
+                        "--auto-file-renaming=false",
+                        "--allow-overwrite=true",
+                        "--dir", jobDir,
+                        url
+                    ])
+
+                    proc.stderr.on("data", async d => {
+                        const line = d.toString()
+                        const info = parseAriaProgress(line)
+
+                        if (info && info.percent !== lastProgress) {
+                            lastProgress = info.percent
+
+                            const bar = progressBar(info.percent)
+
+                            const text =
+                                `📥 *Downloading...*
+
+[${bar}] ${info.percent}%
+
+⚡ Speed : ${info.speed}
+⏱️ ETA   : ${info.eta}`
+
+                            await editMessage(sock, sender, progressKey, text)
+                                .catch(() => { })
+                        }
+                    })
+
+                    proc.stderr.on("data", d => {
+                        console.error("[ARIA2]", d.toString().trim())
+                    })
+                }
+
+                // 🔄 reaction tiap 10 detik
+                const reactInterval = setInterval(() => {
+                    sock.sendMessage(sender, {
+                        react: { text: "🔄", key: m.key }
+                    }).catch(() => { })
+                }, 10000)
+
+                // ======================
+                // ✅ SELESAI
+                // ======================
+                proc.on("close", async () => {
+                    clearInterval(reactInterval)
+                    isDownloading = false
+
+                    const files = fs.readdirSync(jobDir).filter(f => !f.endsWith(".part"))
+
+                    if (!files.length) {
+                        await editMessage(
+                            sock,
+                            sender,
+                            progressKey,
+                            "❌ *Download gagal*"
+                        ).catch(() => { })
+
+                        return processQueue(sock)
+                    }
+
+                    const filename = files[0]
+                    const finalPath = path.join(MIRROR_DIR, filename)
+                    fs.renameSync(path.join(jobDir, filename), finalPath)
+
+                    await editMessage(
+                        sock,
+                        sender,
+                        progressKey,
+                        `✅ *Download selesai!*\n\n📄 ${filename}`
+                    ).catch(() => { })
+
+                    await sock.sendMessage(sender, {
+                        text:
+                            `📦 *Mirror siap*\n\n` +
+                            `📄 ${filename}\n` +
+                            `🔗 ${DOMAIN}/${filename}`
+                    }, { quoted: m })
+
+                    autoDelete(finalPath)
+                    processQueue(sock)
+                })
+            }
             // =======================
             // QC FINAL STABLE
             // =======================
@@ -804,12 +1327,12 @@ const text =
 ┃ 🔹 .toa <reply> mengubah video menjadi audio
 ┃ 🔹 .tomp3  <reply> mengubah video tiktok jadi audio
 ┃ 🔹 .sf untuk mengubah sticker menjadi foto
+┃ 🔹 .m untuk mirror link
 ╰━━━━━━━━━━━━━━━━━━⬣
 `
 
                 await sock.sendMessage(sender, {
-                    image: { url: "https://i.imgur.com/7P5V6XH.jpg" },
-                    caption: menuText
+                    text: menuText
                 }, { quoted: m })
 
                 await react("✅")
@@ -859,6 +1382,8 @@ Bot sedang direstart via PM2...
                     `yt-dlp -f "bv*[height<=2160]+ba/best" \
         --merge-output-format mp4 \
         --downloader aria2c \
+  --user-agent="Mozilla/5.0" \
+  https://pixeldrain.com/api/file/ID?download \
         --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
         --write-info-json \
         -o "${output}" "${url}"`,
@@ -917,5 +1442,4 @@ Bot sedang direstart via PM2...
         }
     })
 }
-
 startBot()
