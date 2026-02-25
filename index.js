@@ -227,15 +227,6 @@ async function startBot() {
             // ===============================
             const isCommand = text.startsWith(".")
 
-            function detectSource(finalUrl) {
-                if (/drive\.google\.com|drive\.usercontent\.google\.com/.test(finalUrl)) {
-                    return "gdrive"
-                }
-                if (/pixeldrain\.com/.test(finalUrl)) {
-                    return "pixeldrain"
-                }
-                return "direct"
-            }
             function pickMainVideo(files) {
                 const videos = files.filter(f => isVideo(f))
                 if (videos.length <= 1) return videos
@@ -326,13 +317,31 @@ async function startBot() {
                 if (/facebook\.com|fb\.watch/.test(url)) return "facebook"
                 return "generic"
             }
-            function logPhotoError(ctx) {
-                console.error("\n🖼️ [PHOTO SEND ERROR]")
-                console.error("────────────────────────")
-                Object.entries(ctx).forEach(([k, v]) => {
-                    console.error(`${k}:`, v)
-                })
-                console.error("────────────────────────\n")
+            // ===============================
+            // ⚡ UPLOAD CONFIG
+            // ===============================
+            const MAX_PARALLEL_UPLOAD = 2
+
+            function parseYtDlpProgress(line) {
+                // contoh:
+                // [download]  45.3% of 10.23MiB at 2.31MiB/s ETA 00:08
+                const percent = line.match(/(\d+(?:\.\d+)?)%/)
+                const speed = line.match(/at\s+([\d.]+\w+\/s)/i)
+                const eta = line.match(/ETA\s+([0-9:]+)/i)
+
+                if (!percent) return null
+
+                return {
+                    percent: Math.floor(Number(percent[1])),
+                    speed: speed ? speed[1] : "-",
+                    eta: eta ? eta[1] : "-"
+                }
+            }
+
+            function renderBar(p) {
+                const total = 10
+                const filled = Math.round((p / 100) * total)
+                return "█".repeat(filled) + "░".repeat(total - filled)
             }
             function isVideo(name) {
                 return /\.(mp4|mkv|webm|mov)$/i.test(name)
@@ -356,6 +365,34 @@ async function startBot() {
                 const m = text.match(/https?:\/\/[^\s]+/i)
                 return m ? m[0] : null
             }
+            function makeVideoStickerUltra(input, output, duration, cb) {
+    const safeDuration = Math.min(duration || 4, 4)
+
+    const args = [
+        "-y",
+        "-i", input,
+        "-ss", "0",
+        "-t", String(safeDuration),
+        "-vf", "scale=512:512:force_original_aspect_ratio=decrease,fps=8",
+        "-lossless", "0",
+        "-q:v", "70",
+        "-compression_level", "6",
+        "-loop", "0",
+        "-an",
+        output
+    ]
+
+    const ff = spawn("ffmpeg", args)
+
+    ff.on("error", err => cb(err))
+
+    ff.on("close", code => {
+        if (code !== 0 || !fs.existsSync(output)) {
+            return cb(new Error("ffmpeg failed"))
+        }
+        cb(null)
+    })
+}
             // =======================
             // Bot Mirror Link
             // =======================
@@ -885,7 +922,7 @@ async function startBot() {
         width:90px;
         height:90px;
         border-radius:50%;
-        background-image:finalUrl('${profilePic}');
+        background-image:url('${profilePic}');
         background-size:cover;
         background-topText:center;
     }
@@ -949,13 +986,16 @@ async function startBot() {
                         fit: "cover",
                         background: { r: 0, g: 0, b: 0, alpha: 0 }
                     })
-                    .webp({ quality: 100 })
+                    .webp({
+    quality: 70,
+    effort: 6
+})
                     .toBuffer()
                 const sticker = new Sticker(webpBuffer, {
                     pack: "KepoBot",
                     author: "Balerina",
                     type: "full",
-                    quality: 100
+                    quality: 70
                 })
 
                 await sock.sendMessage(sender, {
@@ -1126,74 +1166,47 @@ async function startBot() {
             // ================= STICKER VIDEO =================
             if ((command === ".sticker" || command === ".s") && hasVideo) {
 
-                const videoMessage =
-                    m.message?.videoMessage ||
-                    m.message?.extendedTextMessage?.contextInfo?.quotedMessage?.videoMessage
+    if (!videoMessage) {
+        await react("❌")
+        return reply("❌ Reply video untuk dijadikan sticker")
+    }
 
-                if (!videoMessage) {
-                    await react("❌")
-                    return reply("❌ Reply video yang ingin dijadikan sticker")
-                }
+    await react("⏳")
 
-                await react("⏳")
+    const stream = await downloadContentFromMessage(videoMessage, "video")
+    let buffer = Buffer.from([])
+    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk])
 
-                const stream = await downloadContentFromMessage(
-                    videoMessage,
-                    "video"
-                )
+    const input = `input_${Date.now()}.mp4`
+    const output = `sticker_${Date.now()}.webp`
+    fs.writeFileSync(input, buffer)
 
-                let buffer = Buffer.from([])
-                for await (const chunk of stream) {
-                    buffer = Buffer.concat([buffer, chunk])
-                }
+    makeVideoStickerUltra(input, output, videoDuration, async (err) => {
+        if (err) {
+            fs.unlinkSync(input)
+            await react("❌")
+            return reply("❌ Gagal membuat sticker")
+        }
 
-                const input = `input_${Date.now()}.mp4`
-                const output = `sticker_${Date.now()}.webp`
+        const sticker = new Sticker(fs.readFileSync(output), {
+            pack: "KepoBot",
+            author: "Balerina"
+        })
 
-                fs.writeFileSync(input, buffer)
+        await sock.sendMessage(sender, {
+            sticker: await sticker.toBuffer()
+        }, { quoted: m })
 
-                // ⬇️ durasi dinamis (maks 8 detik)
-                const duration = Math.min(videoDuration || 8, 8)
+        fs.unlinkSync(input)
+        fs.unlinkSync(output)
+        await react("✅")
+    })
 
-                exec(
-                    `ffmpeg -y -i "${input}" ` +
-                    `-ss 0 -t ${duration} ` +
-                    `-vf "scale=512:512:force_original_aspect_ratio=decrease,fps=15" ` +
-                    `-loop 0 -an "${output}"`,
-                    async (err) => {
+    return
+}
 
-                        if (err || !fs.existsSync(output)) {
-                            console.error(err)
-                            await react("❌")
-                            return reply("❌ Gagal membuat sticker")
-                        }
 
-                        const sticker = new Sticker(
-                            fs.readFileSync(output),
-                            {
-                                pack: "KepoBot",
-                                author: "Balerina"
-                            }
-                        )
-
-                        await sock.sendMessage(
-                            sender,
-                            { sticker: await sticker.toBuffer() },
-                            { quoted: m }
-                        )
-
-                        fs.unlinkSync(input)
-                        fs.unlinkSync(output)
-
-                        await react("✅")
-                    }
-                )
-
-                return
-            }
-            if ((command === ".sticker" || command === ".s") && !hasImage && !hasVideo) {
-                return reply("❌ Kirim atau reply gambar / video")
-            }
+            
             // ================= WARNING .DL =================
             // if (command.startsWith(".dl")) {
             //     return reply("⚠️ Langsung kirimkan link saja tanpa menggunakan *.dl*")
@@ -1376,6 +1389,7 @@ Bot sedang direstart via PM2...
                 processGlobalQueue(sock)
                 return
             }
+
             async function processGlobalQueue(sock) {
                 if (isProcessingQueue) return
                 if (!downloadQueue.length) return
@@ -1386,201 +1400,218 @@ Bot sedang direstart via PM2...
                 const { sender, m, url, queueKey } = job
 
                 const platform = detectPlatform(url)
-                const timestamp = Date.now()
-                const TMP_DIR = `/tmp/wa_${timestamp}`
-
+                const TMP_DIR = `/tmp/wa_${Date.now()}`
                 fs.mkdirSync(TMP_DIR, { recursive: true })
 
                 const output = `${TMP_DIR}/media_%03d.%(ext)s`
-
-                const referer =
-                    platform === "tiktok"
-                        ? '--referer "https://www.tiktok.com/"'
-                        : ""
+                let lastProgress = -1
 
                 try {
-                    // ===============================
-                    // ⬇️ 1️⃣ DOWNLOAD
-                    // ===============================
                     await setReact(sock, m, "⬇️")
+
                     if (queueKey) {
-                        await editMessage(sock, sender, queueKey, "⬇️ *Downloading media...*")
-                            .catch(() => { })
+                        await editMessage(
+                            sock,
+                            sender,
+                            queueKey,
+                            "⬇️ *Downloading media...*\n░░░░░░░░░░ 0%"
+                        ).catch(() => { })
                     }
 
-                    exec(
-                        `yt-dlp \
-${referer} \
---user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
---merge-output-format mp4 \
--o "${output}" "${url}"`,
-                        async (err) => {
+                    // ===============================
+                    // 🍪 YOUTUBE COOKIES
+                    // ===============================
+                    const COOKIE_DIR = path.join(process.cwd(), "cookies")
+                    const YT_COOKIE_FILE = path.join(COOKIE_DIR, "youtube_cookies.txt")
 
-                            if (err) {
-                                console.error("[QUEUE DOWNLOAD ERROR]", err)
-                                await setReact(sock, m, "❌")
-                                cleanup()
-                                return next()
-                            }
+                    const ytCookiesArgs =
+                        platform === "youtube" && fs.existsSync(YT_COOKIE_FILE)
+                            ? ["--cookies", YT_COOKIE_FILE]
+                            : []
 
-                            // ===============================
-                            // ⚙️ 2️⃣ PROCESS
-                            // ===============================
-                            await setReact(sock, m, "⚙️")
-                            if (queueKey) {
-                                await editMessage(sock, sender, queueKey, "⚙️ *Processing media...*")
-                                    .catch(() => { })
-                            }
+                    // ===============================
+                    // ⬇️ yt-dlp (NO -f best ❗)
+                    // ===============================
+                    const proc = spawn("yt-dlp", [
+                        "--newline",
 
-                            let files = fs.readdirSync(TMP_DIR)
-                                .map(f => path.join(TMP_DIR, f))
-                                .filter(f => fs.statSync(f).isFile())
+                        "--user-agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
 
-                            if (!files.length) {
-                                await setReact(sock, m, "❌")
-                                cleanup()
-                                return next()
-                            }
+                        "--no-playlist",
+                        "--ignore-errors",
+                        "--no-abort-on-error",
 
-                            // ===============================
-                            // 🖼️ CONVERT IMAGE → JPG
-                            // ===============================
-                            const normalizedFiles = []
+                        "--merge-output-format", "mp4",
 
-                            for (const file of files) {
-                                const ext = path.extname(file).toLowerCase()
+                        ...ytCookiesArgs,
 
-                                if (isImage(file) && ext !== ".jpg" && ext !== ".jpeg") {
-                                    const jpgPath = file.replace(ext, ".jpg")
-                                    try {
-                                        await sharp(file)
-                                            .jpeg({ quality: 90 })
-                                            .toFile(jpgPath)
+                        ...(platform === "tiktok"
+                            ? ["--referer", "https://www.tiktok.com/"]
+                            : []),
 
-                                        fs.unlinkSync(file)
-                                        normalizedFiles.push(jpgPath)
-                                    } catch (e) {
-                                        console.warn("[IMAGE CONVERT FAIL]", file, e.message)
-                                    }
-                                } else {
-                                    normalizedFiles.push(file)
-                                }
-                            }
+                        "-o", output,
+                        url
+                    ])
 
-                            files = normalizedFiles
+                    proc.stdout.on("data", async d => {
+                        const line = d.toString()
+                        const info = parseYtDlpProgress(line)
+                        if (!info) return
+                        if (info.percent === lastProgress) return
+                        lastProgress = info.percent
 
-                            // ===============================
-                            // 📄 METADATA (1x)
-                            // ===============================
-                            let caption = "📥 Media downloaded"
-                            try {
-                                const meta = execSync(`yt-dlp --dump-json "${url}"`).toString()
-                                const info = JSON.parse(meta)
-                                caption =
-                                    `🎵 ${info.title || "Media"}\n` +
-                                    (info.uploader ? `👤 ${info.uploader}` : "")
-                            } catch { }
+                        const bar = renderBar(info.percent)
 
-                            // ===============================
-                            // 📦 BUILD MEDIA LIST (CAROUSEL)
-                            // ===============================
-                            const mediaList = []
+                        if (queueKey) {
+                            await editMessage(
+                                sock,
+                                sender,
+                                queueKey,
+                                `⬇️ *Downloading media...*\n` +
+                                `${bar} ${info.percent}%\n\n` +
+                                `⚡ Speed : ${info.speed}\n` +
+                                `⏱️ ETA   : ${info.eta}`
+                            ).catch(() => { })
+                        }
+                    })
 
-                            for (const file of files) {
-                                const stat = fs.statSync(file)
-                                if (stat.size < 5 * 1024) continue
+                    proc.stderr.on("data", d => {
+                        console.error("[YT-DLP]", d.toString().trim())
+                    })
 
-                                if (isImage(file)) {
-                                    mediaList.push({
-                                        type: "image",
-                                        path: file
-                                    })
-                                } else if (isVideo(file)) {
-                                    mediaList.push({
-                                        type: "video",
-                                        path: file
-                                    })
-                                }
-                            }
-
-                            if (!mediaList.length) {
-                                await setReact(sock, m, "❌")
-                                cleanup()
-                                return next()
-                            }
-
-                            // ===============================
-                            // 📤 3️⃣ UPLOAD (RULED)
-                            // ===============================
-                            await setReact(sock, m, "📤")
-                            if (queueKey) {
-                                await editMessage(sock, sender, queueKey, "📤 *Uploading to WhatsApp...*")
-                                    .catch(() => { })
-                            }
-
-                            for (let i = 0; i < mediaList.length; i++) {
-                                const media = mediaList[i]
-                                const filePath = media.path
-                                const fileName = path.basename(filePath)
-                                const sizeMB = fs.statSync(filePath).size / (1024 * 1024)
-                                const isFirst = i === 0
-
-                                try {
-                                    // 📸 FOTO → DOCUMENT
-                                    if (media.type === "image") {
-                                        await sock.sendMessage(sender, {
-                                            document: { url: filePath },
-                                            mimetype: "image/jpeg",
-                                            fileName
-                                        }, { quoted: m })
-                                    }
-
-                                    // 🎥 VIDEO ≤ 30MB
-                                    else if (media.type === "video" && sizeMB <= 30) {
-                                        await sock.sendMessage(sender, {
-                                            video: { url: filePath },
-                                            mimetype: "video/mp4",
-                                            caption: isFirst ? caption : undefined
-                                        }, { quoted: m })
-                                    }
-
-                                    // 🎥 VIDEO > 30MB
-                                    else if (media.type === "video") {
-                                        await sock.sendMessage(sender, {
-                                            document: { url: filePath },
-                                            mimetype: "video/mp4",
-                                            fileName
-                                        }, { quoted: m })
-                                    }
-
-                                } catch (e) {
-                                    logWaError({
-                                        stage: "SEND_MEDIA",
-                                        file: filePath,
-                                        type: media.type,
-                                        sizeMB: sizeMB.toFixed(2),
-                                        error: e?.output?.statusCode || e.message
-                                    })
-                                }
-                            }
-
-                            // ===============================
-                            // ✅ 4️⃣ DONE
-                            // ===============================
-                            await setReact(sock, m, "✅")
+                    proc.on("close", async code => {
+                        if (code !== 0) {
                             if (queueKey) {
                                 await editMessage(
                                     sock,
                                     sender,
                                     queueKey,
-                                    "✅ *Download & upload selesai*"
+                                    "❌ *Gagal download media (YouTube proteksi)*"
                                 ).catch(() => { })
                             }
-
                             cleanup()
-                            next()
+                            return next()
                         }
-                    )
+
+                        // ===============================
+                        // 📂 FILE SCAN
+                        // ===============================
+                        let files = fs.readdirSync(TMP_DIR)
+                            .map(f => path.join(TMP_DIR, f))
+                            .filter(f => fs.statSync(f).isFile())
+
+                        if (!files.length) {
+                            cleanup()
+                            return next()
+                        }
+
+                        // ===============================
+                        // 🖼️ IMAGE → JPG
+                        // ===============================
+                        const normalized = []
+                        for (const f of files) {
+                            if (isImage(f) && !/\.jpe?g$/i.test(f)) {
+                                const jpg = f.replace(path.extname(f), ".jpg")
+                                await sharp(f).jpeg({ quality: 90 }).toFile(jpg)
+                                fs.unlinkSync(f)
+                                normalized.push(jpg)
+                            } else {
+                                normalized.push(f)
+                            }
+                        }
+                        files = normalized
+
+                        // ===============================
+                        // 📄 META
+                        // ===============================
+                        let caption = "📥 Media downloaded"
+                        try {
+                            const meta = JSON.parse(
+                                execSync(`yt-dlp --dump-json "${url}"`).toString()
+                            )
+                            caption =
+                                `🎵 ${meta.title || "Media"}\n` +
+                                (meta.uploader ? `👤 ${meta.uploader}` : "")
+                        } catch { }
+
+                        const images = files.filter(isImage)
+                        const videos = files.filter(isVideo)
+                        const isCarousel = files.length > 1
+
+                        await setReact(sock, m, "📤")
+
+                        if (queueKey) {
+                            await editMessage(
+                                sock,
+                                sender,
+                                queueKey,
+                                `📤 *Uploading ${isCarousel ? "carousel" : "media"}...*`
+                            ).catch(() => { })
+                        }
+
+                        // ===============================
+                        // ⚡ PARALLEL UPLOAD
+                        // ===============================
+                        const tasks = []
+
+                        images.forEach((file, i) => {
+                            tasks.push(async () => {
+                                try {
+                                    await sock.sendMessage(sender, {
+                                        image: { url: file },
+                                        caption: i === 0 ? caption : undefined
+                                    }, { quoted: m })
+                                } catch {
+                                    await sock.sendMessage(sender, {
+                                        document: { url: file },
+                                        mimetype: "image/jpeg",
+                                        fileName: path.basename(file)
+                                    }, { quoted: m })
+                                }
+                            })
+                        })
+
+                        videos.forEach((file, i) => {
+                            tasks.push(async () => {
+                                const sizeMB = fs.statSync(file).size / (1024 * 1024)
+                                if (sizeMB <= 30) {
+                                    await sock.sendMessage(sender, {
+                                        video: { url: file },
+                                        caption: images.length === 0 && i === 0 ? caption : undefined
+                                    }, { quoted: m })
+                                } else {
+                                    await sock.sendMessage(sender, {
+                                        document: { url: file },
+                                        mimetype: "video/mp4",
+                                        fileName: path.basename(file)
+                                    }, { quoted: m })
+                                }
+                            })
+                        })
+
+                        const MAX_PARALLEL_UPLOAD = 2
+                        for (let i = 0; i < tasks.length; i += MAX_PARALLEL_UPLOAD) {
+                            await Promise.all(
+                                tasks.slice(i, i + MAX_PARALLEL_UPLOAD).map(fn => fn())
+                            )
+                        }
+
+                        await setReact(sock, m, "✅")
+
+                        if (queueKey) {
+                            await editMessage(
+                                sock,
+                                sender,
+                                queueKey,
+                                "✅ *Download & upload selesai*"
+                            ).catch(() => { })
+                        }
+
+                        cleanup()
+                        next()
+                    })
+
                 } catch (e) {
                     console.error("[QUEUE FATAL]", e)
                     cleanup()
@@ -1590,10 +1621,7 @@ ${referer} \
                 function cleanup() {
                     try {
                         fs.rmSync(TMP_DIR, { recursive: true, force: true })
-                        console.log("[TMP CLEANED]", TMP_DIR)
-                    } catch (e) {
-                        console.error("[TMP CLEAN ERROR]", e.message)
-                    }
+                    } catch { }
                 }
 
                 function next() {
