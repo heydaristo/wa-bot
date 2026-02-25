@@ -21,7 +21,11 @@ const puppeteer = require("puppeteer")
 const os = require("os")
 
 const { Sticker } = require("wa-sticker-formatter")
-
+// ===============================
+// 🌍 GLOBAL DOWNLOAD QUEUE
+// ===============================
+const downloadQueue = []
+let isProcessingQueue = false
 // untuk mirror bot
 const MIRROR_DIR = '/var/www/mirror'
 const DOMAIN = 'https://mirror.heydaristo.my.id'
@@ -39,6 +43,13 @@ async function editMessage(sock, jid, key, text) {
         text,
         edit: key
     })
+}
+async function setReact(sock, m, emoji) {
+    try {
+        await sock.sendMessage(m.key.remoteJid, {
+            react: { text: emoji, key: m.key }
+        })
+    } catch { }
 }
 async function startBot() {
 
@@ -144,8 +155,6 @@ async function startBot() {
 
             const rawText = args.slice(1).join(" ").trim()
 
-            let url = null
-
             // ===== WAJIB ADA =====
             let stickerText = rawText
             // === setelah command & rawText didapat ===
@@ -179,18 +188,24 @@ async function startBot() {
             if (topText === bottomText) {
                 topText = ""
             }
-            // Jika format: .dl link
-            if (args[1] && args[1].startsWith("http")) {
-                url = args[1]
-            }
-
-            // Jika kirim link saja
-            if (text.startsWith("http")) {
-                url = text.trim()
-            }
             const quoted =
                 m.message?.extendedTextMessage?.contextInfo?.quotedMessage || null
 
+            // 🔹 URL untuk command (.ytv, .yta, .mirror)
+            let url = null
+            if (args[1]?.startsWith("http")) {
+                url = args[1]
+            }
+
+            // 🔹 URL tanpa prefix (auto download)
+            const autoUrl = extractUrlFromText(text)
+
+            // 🔹 URL final untuk deteksi platform
+            const finalUrl = url || autoUrl
+
+            // ===============================
+            // MEDIA CONTEXT
+            // ===============================
             const imageMessage =
                 m.message?.imageMessage ||
                 m.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage ||
@@ -206,46 +221,55 @@ async function startBot() {
             const hasImage = !!imageMessage
             const hasVideo = !!videoMessage
             const videoDuration = videoMessage?.seconds || 0
-            const urlRegex = /(https?:\/\/[^\s]+)/g
-            const match = text ? text.match(urlRegex) : null
-            // const url = match ? match[0] : null
 
-            const isYoutube = url
-                ? (url.includes("youtube.com") || url.includes("youtu.be"))
-                : false
-            function detectSource(url) {
-                if (/drive\.google\.com|drive\.usercontent\.google\.com/.test(url)) {
+            // ===============================
+            // FLAGS
+            // ===============================
+            const isCommand = text.startsWith(".")
+
+            function detectSource(finalUrl) {
+                if (/drive\.google\.com|drive\.usercontent\.google\.com/.test(finalUrl)) {
                     return "gdrive"
                 }
-                if (/pixeldrain\.com/.test(url)) {
+                if (/pixeldrain\.com/.test(finalUrl)) {
                     return "pixeldrain"
                 }
                 return "direct"
             }
-            function detectSource(url) {
-                if (/drive\.google\.com|drive\.usercontent\.google\.com/.test(url)) {
+            function pickMainVideo(files) {
+                const videos = files.filter(f => isVideo(f))
+                if (videos.length <= 1) return videos
+
+                return [
+                    videos.sort((a, b) =>
+                        fs.statSync(b).size - fs.statSync(a).size
+                    )[0]
+                ]
+            }
+            function detectSource(finalUrl) {
+                if (/drive\.google\.com|drive\.usercontent\.google\.com/.test(finalUrl)) {
                     return "gdrive"
                 }
-                if (/pixeldrain\.com/.test(url)) {
+                if (/pixeldrain\.com/.test(finalUrl)) {
                     return "pixeldrain"
                 }
                 return "direct"
             }
-            function normalizeDriveUrl(url) {
+            function normalizeDriveUrl(finalUrl) {
                 // drive.usercontent.google.com → drive.google.com/uc
-                if (url.includes("drive.usercontent.google.com")) {
-                    const u = new URL(url)
+                if (finalUrl.includes("drive.usercontent.google.com")) {
+                    const u = new URL(finalUrl)
                     const id = u.searchParams.get("id")
                     if (id) return `https://drive.google.com/uc?id=${id}`
                 }
 
                 // drive.google.com/file/d/ID/view → uc?id=ID
-                const match = url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/)
+                const match = finalUrl.match(/\/file\/d\/([a-zA-Z0-9_-]+)/)
                 if (match) {
                     return `https://drive.google.com/uc?id=${match[1]}`
                 }
 
-                return url
+                return finalUrl
             }
             function parseAriaProgress(line) {
                 // contoh:
@@ -293,6 +317,44 @@ async function startBot() {
                     remain,
                     expireAt
                 }
+            }
+            function detectPlatform(url) {
+                if (/youtube\.com|youtu\.be/.test(url)) return "youtube"
+                if (/tiktok\.com/.test(url)) return "tiktok"
+                if (/instagram\.com/.test(url)) return "instagram"
+                if (/twitter\.com|x\.com/.test(url)) return "twitter"
+                if (/facebook\.com|fb\.watch/.test(url)) return "facebook"
+                return "generic"
+            }
+            function logPhotoError(ctx) {
+                console.error("\n🖼️ [PHOTO SEND ERROR]")
+                console.error("────────────────────────")
+                Object.entries(ctx).forEach(([k, v]) => {
+                    console.error(`${k}:`, v)
+                })
+                console.error("────────────────────────\n")
+            }
+            function isVideo(name) {
+                return /\.(mp4|mkv|webm|mov)$/i.test(name)
+            }
+
+            function isImage(name) {
+                return /\.(jpg|jpeg|png|webp|heic)$/i.test(name)
+            }
+
+            function logWaError({ stage, file, type, sizeMB, error }) {
+                console.error("🧨 WA ERROR")
+                console.error({
+                    stage,
+                    file,
+                    type,
+                    sizeMB,
+                    error
+                })
+            }
+            function extractUrlFromText(text) {
+                const m = text.match(/https?:\/\/[^\s]+/i)
+                return m ? m[0] : null
             }
             // =======================
             // Bot Mirror Link
@@ -554,18 +616,18 @@ async function startBot() {
                     return reply("❌ Aksi dibatalkan.")
                 }
                 // ======================
-                // 🔗 LINK MIRROR (URL)
+                // 🔗 LINK MIRROR (finalUrl)
                 // ======================
-                const url = extractHttpUrl(rawInput)
+                const finalUrl = extractHttpUrl(rawInput)
 
-                if (!url) {
+                if (!finalUrl) {
                     return reply("❌ Link tidak valid. Gunakan http/https.")
                 }
 
-                const source = detectSource(url)
+                const source = detectSource(finalUrl)
 
                 mirrorQueue.push({
-                    url,
+                    finalUrl,
                     sender,
                     m,
                     source
@@ -585,7 +647,7 @@ async function startBot() {
 
                 isDownloading = true
                 const job = mirrorQueue.shift()
-                const { url, sender, m, source } = job
+                const { finalUrl, sender, m, source } = job
 
                 const jobId = Date.now().toString()
                 const jobDir = path.join(MIRROR_DIR, `job_${jobId}`)
@@ -606,8 +668,8 @@ async function startBot() {
                 // 📦 GOOGLE DRIVE
                 // ======================
                 if (source === "gdrive") {
-                    const driveUrl = normalizeDriveUrl(url)
-                    console.log("[GDRIVE] URL:", driveUrl)
+                    const driveUrl = normalizeDriveUrl(finalUrl)
+                    console.log("[GDRIVE] finalUrl:", driveUrl)
 
                     proc = spawn("gdown", ["--fuzzy", driveUrl], { cwd: jobDir })
 
@@ -648,7 +710,7 @@ async function startBot() {
                         "--auto-file-renaming=false",
                         "--allow-overwrite=true",
                         "--dir", jobDir,
-                        url
+                        finalUrl
                     ])
 
                     proc.stderr.on("data", async d => {
@@ -823,7 +885,7 @@ async function startBot() {
         width:90px;
         height:90px;
         border-radius:50%;
-        background-image:url('${profilePic}');
+        background-image:finalUrl('${profilePic}');
         background-size:cover;
         background-topText:center;
     }
@@ -1137,172 +1199,99 @@ async function startBot() {
             //     return reply("⚠️ Langsung kirimkan link saja tanpa menggunakan *.dl*")
             // }
 
-            // ================= YOUTUBE VIDEO =================
-            if (isYoutube && command.startsWith(".ytv")) {
-
-                await react("⏳")
-
-                const output = `ytvideo_${Date.now()}.mp4`
-
-                exec(`yt-dlp -f best --merge-output-format mp4 -o "${output}" "${url}"`,
-                    async (err) => {
-
-                        if (err) {
-                            await react("❌")
-                            return reply("❌ Gagal download video.")
-                        }
-
-                        const sizeMB = fs.statSync(output).size / (1024 * 1024)
-
-                        if (sizeMB <= 30) {
-                            await sock.sendMessage(sender, {
-                                video: { url: path.resolve(output) }
-                            }, { quoted: m })
-                        } else {
-                            await sock.sendMessage(sender, {
-                                document: { url: path.resolve(output) },
-                                mimetype: "video/mp4",
-                                fileName: "video.mp4"
-                            }, { quoted: m })
-                        }
-
-                        fs.unlinkSync(output)
-                        await react("✅")
-                    })
-
-                return
-            }
-
-            // ================= YOUTUBE AUDIO =================
-            if (isYoutube && command.startsWith(".yta")) {
-
-                await react("⏳")
-
-                const output = `ytaudio_${Date.now()}.mp3`
-
-                exec(`yt-dlp -x --audio-format mp3 -o "${output}" "${url}"`,
-                    async (err) => {
-
-                        if (err) {
-                            await react("❌")
-                            return reply("❌ Gagal download audio.")
-                        }
-
-                        await sock.sendMessage(sender, {
-                            audio: { url: path.resolve(output) },
-                            mimetype: "audio/mpeg"
-                        }, { quoted: m })
-
-                        fs.unlinkSync(output)
-                        await react("✅")
-                    })
-
-                return
-            }
             // =================================
-            // TOMP3 HANDLER (PRIORITAS 1)
+            // UNIVERSAL AUDIO CONVERTER
+            // COMMAND: .mp3 / .toa
             // =================================
-            if (command === ".tomp3" || command === ".mp3") {
-
-                if (!url) {
-                    await react("❌")
-                    return
-                }
+            if (command === ".mp3" || command === ".toa") {
 
                 await react("⏳")
 
                 const timestamp = Date.now()
                 const audioPath = `audio_${timestamp}.mp3`
 
+                // ===============================
+                // 1️⃣ PRIORITAS: REPLY VIDEO
+                // ===============================
+                const quotedVideo =
+                    m.message?.extendedTextMessage?.contextInfo?.quotedMessage?.videoMessage
+
+                if (quotedVideo) {
+                    try {
+                        const stream = await downloadContentFromMessage(
+                            quotedVideo,
+                            "video"
+                        )
+
+                        const videoPath = `video_${timestamp}.mp4`
+                        const buffer = []
+
+                        for await (const chunk of stream) buffer.push(chunk)
+                        fs.writeFileSync(videoPath, Buffer.concat(buffer))
+
+                        exec(
+                            `ffmpeg -y -i "${videoPath}" -vn -ab 128k -ar 44100 "${audioPath}"`,
+                            async (err) => {
+
+                                fs.unlinkSync(videoPath)
+
+                                if (err || !fs.existsSync(audioPath)) {
+                                    await react("❌")
+                                    return reply("❌ Gagal convert video ke audio")
+                                }
+
+                                await sock.sendMessage(sender, {
+                                    audio: { url: path.resolve(audioPath) },
+                                    mimetype: "audio/mpeg",
+                                    ptt: false
+                                }, { quoted: m })
+
+                                fs.unlinkSync(audioPath)
+                                await react("✅")
+                            }
+                        )
+
+                    } catch (e) {
+                        console.error("TOA ERROR:", e)
+                        await react("❌")
+                    }
+
+                    return
+                }
+
+                // ===============================
+                // 2️⃣ LINK (YT / TT / DLL)
+                // ===============================
+                if (!finalUrl) {
+                    await react("❌")
+                    return reply("❌ Kirim link atau reply video")
+                }
+
                 exec(
-                    `yt-dlp -x --audio-format mp3 --audio-quality 0 -o "audio_${timestamp}.%(ext)s" "${url}"`,
+                    `yt-dlp \
+--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+-x --audio-format mp3 --audio-quality 0 \
+-o "audio_${timestamp}.%(ext)s" "${finalUrl}"`,
                     async (err) => {
 
                         if (err || !fs.existsSync(audioPath)) {
+                            console.error("MP3 ERROR:", err)
                             await react("❌")
-                            return
+                            return reply("❌ Gagal download audio")
                         }
 
-                        try {
+                        await sock.sendMessage(sender, {
+                            audio: { url: path.resolve(audioPath) },
+                            mimetype: "audio/mpeg",
+                            ptt: false
+                        }, { quoted: m })
 
-                            await sock.sendMessage(sender, {
-                                audio: { url: path.resolve(audioPath) },
-                                mimetype: "audio/mpeg",
-                                ptt: false
-                            }, { quoted: m })
-
-                            await react("✅")
-
-                        } catch (e) {
-                            console.log("SEND AUDIO ERROR:", e)
-                            await react("❌")
-                        }
-
-                        if (fs.existsSync(audioPath)) {
-                            fs.unlinkSync(audioPath)
-                        }
+                        fs.unlinkSync(audioPath)
+                        await react("✅")
                     }
                 )
 
                 return
-            }
-            if (command === ".toa") {
-
-                try {
-
-                    const quoted = m.message?.extendedTextMessage?.contextInfo?.quotedMessage
-
-                    if (!quoted || !quoted.videoMessage) {
-                        return react("❌")
-                    }
-
-                    await react("⏳")
-
-                    const stream = await downloadContentFromMessage(
-                        quoted.videoMessage,
-                        "video"
-                    )
-
-                    const videoPath = `video_${Date.now()}.mp4`
-                    const audioPath = `audio_${Date.now()}.mp3`
-
-                    const buffer = []
-                    for await (const chunk of stream) {
-                        buffer.push(chunk)
-                    }
-
-                    require("fs").writeFileSync(videoPath, Buffer.concat(buffer))
-
-                    require("child_process").exec(
-                        `ffmpeg -i ${videoPath} -vn -ab 128k -ar 44100 -y ${audioPath}`,
-                        async (err) => {
-
-                            require("fs").unlinkSync(videoPath)
-
-                            if (err) {
-                                await react("❌")
-                                return
-                            }
-
-                            const audioBuffer = require("fs").readFileSync(audioPath)
-
-                            await sock.sendMessage(sender, {
-                                audio: audioBuffer,
-                                mimetype: "audio/mpeg",
-                                ptt: false
-                            }, { quoted: m })
-
-                            require("fs").unlinkSync(audioPath)
-
-                            await react("✅")
-                        }
-                    )
-
-                } catch (err) {
-                    console.log(err)
-                    await react("❌")
-                }
-
             }
             // ======================================
             // PREMIUM TELEGRAM STYLE MENU
@@ -1322,8 +1311,6 @@ async function startBot() {
 
 ╭━━━〔 📥 DOWNLOAD 〕━━━⬣
 ┃ 🔹  <link> untuk download video dari media sosial
-┃ 🔹 .ytv <link> untuk mendownload video youtube
-┃ 🔹 .yta <link> untuk mendownload audio youtube
 ┃ 🔹 .toa <reply> mengubah video menjadi audio
 ┃ 🔹 .tomp3  <reply> mengubah video tiktok jadi audio
 ┃ 🔹 .sf untuk mengubah sticker menjadi foto
@@ -1369,65 +1356,250 @@ Bot sedang direstart via PM2...
                 return
             }
             // ======================================
-            // AUTO UNIVERSAL LINK (VIDEO / FOTO)
+            // 🌍 UNIVERSAL MEDIA (VIDEO + FOTO)
+            // GROUPING ALBUM + /tmp SAFE
             // ======================================
-            if (command === ".dl" && url || url && !text.startsWith(".") && !isYoutube) {
+            if (autoUrl && !isCommand) {
 
-                await react("⏳")
+                await react("📥")
 
-                const timestamp = Date.now()
-                const output = `video_${timestamp}.%(ext)s`
+                const queueMsg = await sock.sendMessage(sender, {
+                    text: `📌 *Masuk antrian*\n📥 Posisi: ${downloadQueue.length}`
+                }, { quoted: m })
 
-                exec(
-                    `yt-dlp -f "bv*[height<=2160]+ba/best" \
-        --merge-output-format mp4 \
-        --downloader aria2c \
-  --user-agent="Mozilla/5.0" \
-  https://pixeldrain.com/api/file/ID?download \
-        --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
-        --write-info-json \
-        -o "${output}" "${url}"`,
-                    async (err) => {
-
-                        if (err) {
-                            await react("❌")
-                            return
-                        }
-
-                        const videoFile = fs.readdirSync("./")
-                            .find(f => f.startsWith(`video_${timestamp}`) && !f.endsWith(".json"))
-
-                        const infoFile = fs.readdirSync("./")
-                            .find(f => f.startsWith(`video_${timestamp}`) && f.endsWith(".info.json"))
-
-                        let captionText = ""
-
-                        if (infoFile) {
-                            try {
-                                const info = JSON.parse(fs.readFileSync(infoFile))
-                                captionText = info.description || info.title || ""
-                            } catch { }
-                            fs.unlinkSync(infoFile)
-                        }
-
-                        if (!videoFile) {
-                            await react("❌")
-                            return
-                        }
-
-                        const videoPath = path.resolve(videoFile)
-
-                        await sock.sendMessage(sender, {
-                            video: { url: videoPath },
-                            caption: `📹 *Downloaded Successfully*\n\n${captionText.slice(0, 900)}`
-                        }, { quoted: m })
-
-                        fs.unlinkSync(videoPath)
-                        await react("✅")
-                    }
-                )
-
+                downloadQueue.push({
+                    sender,
+                    m,
+                    url: finalUrl,
+                    queueKey: queueMsg.key // 🔑 SIMPAN KEY
+                })
+                processGlobalQueue(sock)
                 return
+            }
+            async function processGlobalQueue(sock) {
+                if (isProcessingQueue) return
+                if (!downloadQueue.length) return
+
+                isProcessingQueue = true
+
+                const job = downloadQueue.shift()
+                const { sender, m, url, queueKey } = job
+
+                const platform = detectPlatform(url)
+                const timestamp = Date.now()
+                const TMP_DIR = `/tmp/wa_${timestamp}`
+
+                fs.mkdirSync(TMP_DIR, { recursive: true })
+
+                const output = `${TMP_DIR}/media_%03d.%(ext)s`
+
+                const referer =
+                    platform === "tiktok"
+                        ? '--referer "https://www.tiktok.com/"'
+                        : ""
+
+                try {
+                    // ===============================
+                    // ⬇️ 1️⃣ DOWNLOAD
+                    // ===============================
+                    await setReact(sock, m, "⬇️")
+                    if (queueKey) {
+                        await editMessage(sock, sender, queueKey, "⬇️ *Downloading media...*")
+                            .catch(() => { })
+                    }
+
+                    exec(
+                        `yt-dlp \
+${referer} \
+--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+--merge-output-format mp4 \
+-o "${output}" "${url}"`,
+                        async (err) => {
+
+                            if (err) {
+                                console.error("[QUEUE DOWNLOAD ERROR]", err)
+                                await setReact(sock, m, "❌")
+                                cleanup()
+                                return next()
+                            }
+
+                            // ===============================
+                            // ⚙️ 2️⃣ PROCESS
+                            // ===============================
+                            await setReact(sock, m, "⚙️")
+                            if (queueKey) {
+                                await editMessage(sock, sender, queueKey, "⚙️ *Processing media...*")
+                                    .catch(() => { })
+                            }
+
+                            let files = fs.readdirSync(TMP_DIR)
+                                .map(f => path.join(TMP_DIR, f))
+                                .filter(f => fs.statSync(f).isFile())
+
+                            if (!files.length) {
+                                await setReact(sock, m, "❌")
+                                cleanup()
+                                return next()
+                            }
+
+                            // ===============================
+                            // 🖼️ CONVERT IMAGE → JPG
+                            // ===============================
+                            const normalizedFiles = []
+
+                            for (const file of files) {
+                                const ext = path.extname(file).toLowerCase()
+
+                                if (isImage(file) && ext !== ".jpg" && ext !== ".jpeg") {
+                                    const jpgPath = file.replace(ext, ".jpg")
+                                    try {
+                                        await sharp(file)
+                                            .jpeg({ quality: 90 })
+                                            .toFile(jpgPath)
+
+                                        fs.unlinkSync(file)
+                                        normalizedFiles.push(jpgPath)
+                                    } catch (e) {
+                                        console.warn("[IMAGE CONVERT FAIL]", file, e.message)
+                                    }
+                                } else {
+                                    normalizedFiles.push(file)
+                                }
+                            }
+
+                            files = normalizedFiles
+
+                            // ===============================
+                            // 📄 METADATA (1x)
+                            // ===============================
+                            let caption = "📥 Media downloaded"
+                            try {
+                                const meta = execSync(`yt-dlp --dump-json "${url}"`).toString()
+                                const info = JSON.parse(meta)
+                                caption =
+                                    `🎵 ${info.title || "Media"}\n` +
+                                    (info.uploader ? `👤 ${info.uploader}` : "")
+                            } catch { }
+
+                            // ===============================
+                            // 📦 BUILD MEDIA LIST (CAROUSEL)
+                            // ===============================
+                            const mediaList = []
+
+                            for (const file of files) {
+                                const stat = fs.statSync(file)
+                                if (stat.size < 5 * 1024) continue
+
+                                if (isImage(file)) {
+                                    mediaList.push({
+                                        type: "image",
+                                        path: file
+                                    })
+                                } else if (isVideo(file)) {
+                                    mediaList.push({
+                                        type: "video",
+                                        path: file
+                                    })
+                                }
+                            }
+
+                            if (!mediaList.length) {
+                                await setReact(sock, m, "❌")
+                                cleanup()
+                                return next()
+                            }
+
+                            // ===============================
+                            // 📤 3️⃣ UPLOAD (RULED)
+                            // ===============================
+                            await setReact(sock, m, "📤")
+                            if (queueKey) {
+                                await editMessage(sock, sender, queueKey, "📤 *Uploading to WhatsApp...*")
+                                    .catch(() => { })
+                            }
+
+                            for (let i = 0; i < mediaList.length; i++) {
+                                const media = mediaList[i]
+                                const filePath = media.path
+                                const fileName = path.basename(filePath)
+                                const sizeMB = fs.statSync(filePath).size / (1024 * 1024)
+                                const isFirst = i === 0
+
+                                try {
+                                    // 📸 FOTO → DOCUMENT
+                                    if (media.type === "image") {
+                                        await sock.sendMessage(sender, {
+                                            document: { url: filePath },
+                                            mimetype: "image/jpeg",
+                                            fileName
+                                        }, { quoted: m })
+                                    }
+
+                                    // 🎥 VIDEO ≤ 30MB
+                                    else if (media.type === "video" && sizeMB <= 30) {
+                                        await sock.sendMessage(sender, {
+                                            video: { url: filePath },
+                                            mimetype: "video/mp4",
+                                            caption: isFirst ? caption : undefined
+                                        }, { quoted: m })
+                                    }
+
+                                    // 🎥 VIDEO > 30MB
+                                    else if (media.type === "video") {
+                                        await sock.sendMessage(sender, {
+                                            document: { url: filePath },
+                                            mimetype: "video/mp4",
+                                            fileName
+                                        }, { quoted: m })
+                                    }
+
+                                } catch (e) {
+                                    logWaError({
+                                        stage: "SEND_MEDIA",
+                                        file: filePath,
+                                        type: media.type,
+                                        sizeMB: sizeMB.toFixed(2),
+                                        error: e?.output?.statusCode || e.message
+                                    })
+                                }
+                            }
+
+                            // ===============================
+                            // ✅ 4️⃣ DONE
+                            // ===============================
+                            await setReact(sock, m, "✅")
+                            if (queueKey) {
+                                await editMessage(
+                                    sock,
+                                    sender,
+                                    queueKey,
+                                    "✅ *Download & upload selesai*"
+                                ).catch(() => { })
+                            }
+
+                            cleanup()
+                            next()
+                        }
+                    )
+                } catch (e) {
+                    console.error("[QUEUE FATAL]", e)
+                    cleanup()
+                    next()
+                }
+
+                function cleanup() {
+                    try {
+                        fs.rmSync(TMP_DIR, { recursive: true, force: true })
+                        console.log("[TMP CLEANED]", TMP_DIR)
+                    } catch (e) {
+                        console.error("[TMP CLEAN ERROR]", e.message)
+                    }
+                }
+
+                function next() {
+                    isProcessingQueue = false
+                    processGlobalQueue(sock)
+                }
             }
         } catch (err) {
             console.error("BOT ERROR:", err)
