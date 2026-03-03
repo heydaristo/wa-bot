@@ -2,7 +2,7 @@
 
 <img src="assets/images/ourin.jpg" alt="Ourin-AI Banner" width="200" style="border-radius: 50%"/>
 
-# 🤖 Ourin-AI — WhatsApp Bot
+# 🤖 Kepo-Botz — WhatsApp Bot
 
 > Bot WhatsApp multifungsi berbasis **Baileys** dengan arsitektur plugin modular, sistem database persisten, penjadwalan otomatis, dan ratusan fitur siap pakai.
 
