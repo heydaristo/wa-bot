@@ -1,0 +1,26 @@
+{
+  "selfMode": false,
+  "ownerNumbers": [],
+  "ownerType": 2,
+  "welcomeType": 2,
+  "replyVariant": 6,
+  "menuVariant": 11,
+  "botAfk": {
+    "active": false
+  },
+  "cmdVn": false,
+  "autoSholatKota": {
+    "id": "2622",
+    "nama": "KOTA MAKASSAR"
+  },
+  "onlyGc": false,
+  "onlyPc": false,
+  "giveaways": [],
+  "botMode": "public",
+  "audioMenu": true,
+  "transactionSessions": {},
+  "premiumUsers": [],
+  "similarity": true,
+  "goodbyeType": 2,
+  "lastLimitReset": "2026-03-02T17:00:00.017Z"
+}

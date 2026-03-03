@@ -1,1645 +1,364 @@
+/**
+ * Credits & Thanks to
+ * Developer = Lucky Archz ( Zann )
+ * Lead owner = HyuuSATAN
+ * Owner = Keisya
+ * Owner = Syura Salsabila
+ * Designer = Danzzz
+ * Wileys = Penyedia baileys
+ * Penyedia API
+ * Penyedia Scraper
+ *
+ * JANGAN HAPUS/GANTI CREDITS & THANKS TO
+ * JANGAN DIJUAL YA MEK
+ */
+
+const originalConsoleLog = console.log;
+console.log = (...args) => {
+  const msg = args
+    .map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a)))
+    .join(" ");
+  if (msg.includes("Closing") && (msg.includes("session") || msg.includes("SessionEntry"))) return;
+  if (msg.includes("prekey") || msg.includes("_chains") || msg.includes("registrationId")) return;
+  if (msg.includes("Buffer") || msg.includes("chainKey") || msg.includes("ephemeralKeyPair")) return;
+  if (msg.includes("rootKey") || msg.includes("indexInfo") || msg.includes("pendingPreKey")) return;
+  if (msg.includes("currentRatchet") || msg.includes("baseKey") || msg.includes("privKey")) return;
+  originalConsoleLog.apply(console, args);
+};
+
+const path = require("path");
+const fs = require("fs");
+const config = require("./config");
+const { startConnection } = require("./src/connection");
 const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason,
-    downloadContentFromMessage,
-    Browsers,
-    fetchLatestBaileysVersion
-} = require("@whiskeysockets/baileys");
-const P = require("pino")
-const qrcode = require("qrcode-terminal")
-const { exec, execSync } = require("child_process")
-const fs = require("fs")
-const path = require("path")
-const { buildStickerSvg } = require("./utils/stickerText")
-const { stickerWebpToImage } = require("./utils/stickerToImage")
-const { spawn } = require("child_process")
-const pino = require("pino");
+  messageHandler,
+  groupHandler,
+  messageUpdateHandler,
+  groupSettingsHandler
+} = require("./src/handler");
+const { loadPlugins, pluginStore } = require("./src/lib/plugins");
+const { initDatabase, getDatabase } = require("./src/lib/database");
+const {
+  initScheduler,
+  loadScheduledMessages,
+  startGroupScheduleChecker,
+  startSewaChecker
+} = require("./src/lib/scheduler");
+const { startAutoBackup } = require("./src/lib/backup");
+const { handler: autoLinkHandler } = require("./plugins/main/autolink");
+const { handleAntiTagSW } = require("./src/lib/groupProtection");
+const { initSholatScheduler } = require("./src/lib/sholatScheduler");
+const { initAutoJpmScheduler } = require("./src/lib/autojpmScheduler");
 
-const sharp = require("sharp")
-const puppeteer = require("puppeteer")
-const os = require("os")
+let startOrderPoller = null;
+try {
+  const orderPoller = require("./src/lib/orderPoller");
+  startOrderPoller = orderPoller.startOrderPoller;
+} catch { }
 
-const { Sticker } = require("wa-sticker-formatter")
-// ===============================
-// 🌍 GLOBAL DOWNLOAD QUEUE
-// ===============================
-const downloadQueue = []
-let isProcessingQueue = false
-// untuk mirror bot
-const MIRROR_DIR = '/var/www/mirror'
-const DOMAIN = 'https://mirror.heydaristo.my.id'
-// ===== MIRROR QUEUE =====
-const mirrorQueue = []
-let isDownloading = false
-// ===== QUEUE CONTROL =====
-let isPaused = false
-// ===== DELETE CONFIRM STATE =====
-let pendingDelete = null
-let pendingClear = null
+const {
+  logger,
+  c,
+  printBanner,
+  printStartup,
+  logConnection,
+  logErrorBox,
+  logPlugin,
+  divider
+} = require("./src/lib/colors");
 
-async function editMessage(sock, jid, key, text) {
-    return sock.sendMessage(jid, {
-        text,
-        edit: key
-    })
+const originalFetch = global.fetch;
+global.fetch = async function (url, ...args) {
+  if (
+    typeof url === "string" &&
+    url.includes("raw.githubusercontent.com/tskiofc/ChannelID")
+  ) {
+    return {
+      ok: true,
+      json: async () => [],
+      text: async () => "[]"
+    };
+  }
+  return originalFetch(url, ...args);
+};
+
+const startTime = Date.now();
+let pluginWatcher = null;
+const reloadDebounce = new Map();
+
+function startDevWatcher(pluginsPath) {
+  if (pluginWatcher) pluginWatcher.close();
+  logger.system("Dev Mode", "Plugin hot reload enabled");
+
+  pluginWatcher = fs.watch(pluginsPath, { recursive: true }, (eventType, filename) => {
+    if (!filename || !filename.endsWith(".js")) return;
+    const existingTimeout = reloadDebounce.get(filename);
+    if (existingTimeout) clearTimeout(existingTimeout);
+
+    const timeout = setTimeout(() => {
+      reloadDebounce.delete(filename);
+      const fullPath = path.join(pluginsPath, filename);
+
+      if (!fs.existsSync(fullPath)) {
+        const pluginName = path.basename(filename, ".js");
+        const { unloadPlugin } = require("./src/lib/plugins");
+        const result = unloadPlugin(pluginName);
+        if (result.success) logger.warn("Plugin removed", filename);
+        return;
+      }
+
+      try {
+        const { hotReloadPlugin } = require("./src/lib/plugins");
+        const result = hotReloadPlugin(fullPath);
+        if (!result.success) logger.error("Reload failed", `${filename}: ${result.error}`);
+      } catch (error) {
+        logger.error("Reload failed", `${filename}: ${error.message}`);
+      }
+    }, 500);
+
+    reloadDebounce.set(filename, timeout);
+  });
+
+  logger.debug("Watching", pluginsPath);
 }
-async function setReact(sock, m, emoji) {
-    try {
-        await sock.sendMessage(m.key.remoteJid, {
-            react: { text: emoji, key: m.key }
-        })
-    } catch { }
+
+let srcWatcher = null;
+
+function startSrcWatcher(srcPath) {
+  if (srcWatcher) srcWatcher.close();
+  logger.system("Dev Mode", "Src hot reload enabled");
+
+  srcWatcher = fs.watch(srcPath, { recursive: true }, (eventType, filename) => {
+    if (!filename || !filename.endsWith(".js")) return;
+    const existingTimeout = reloadDebounce.get("src_" + filename);
+    if (existingTimeout) clearTimeout(existingTimeout);
+
+    const timeout = setTimeout(() => {
+      reloadDebounce.delete("src_" + filename);
+      const fullPath = path.join(srcPath, filename);
+
+      if (!fs.existsSync(fullPath)) {
+        logger.warn("Src file removed", filename);
+        return;
+      }
+
+      try {
+        delete require.cache[require.resolve(fullPath)];
+        logger.success("Src reloaded", filename);
+      } catch (error) {
+        logger.error("Src reload failed", `${filename}: ${error.message}`);
+      }
+    }, 500);
+
+    reloadDebounce.set("src_" + filename, timeout);
+  });
+
+  logger.debug("Watching", srcPath);
 }
-async function startBot() {
 
-
-    const { state, saveCreds } = await useMultiFileAuthState("auth_info_baileys");
-
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(
-        `Using WhatsApp Web version: ${version.join(".")} | isLatest: ${isLatest}`
+function setupAntiCrash() {
+  process.on("uncaughtException", (error) => {
+    const ignoredErrors = [
+      'write EOF', 'ECONNRESET', 'EPIPE',
+      'ETIMEDOUT', 'ENOTFOUND', 'ECONNREFUSED', 'read ECONNRESET'
+    ];
+    const isIgnored = ignoredErrors.some(msg =>
+      error.message?.includes(msg) || error.code === msg
     );
-    const sock = makeWASocket({
-        version,
-        auth: state,
-        logger: pino({ level: "silent" }),
-        browser: Browsers.macOS("Desktop"),
-        syncFullHistory: false
-    });
-    sock.ev.on("creds.update", saveCreds)
+    if (isIgnored) return;
+    logErrorBox("Uncaught Exception", error.message);
+    if (config.dev?.debugLog) console.error(c.gray(error.stack));
+    logger.info("SYSTEM", "Bot tetap berjalan...");
+  });
 
-    sock.ev.on("connection.update", (update) => {
-        const { connection, lastDisconnect, qr } = update;
+  process.on("unhandledRejection", (reason) => {
+    logErrorBox("Unhandled Rejection", String(reason));
+    if (config.dev?.debugLog) console.error(c.gray(String(reason)));
+    logger.info("SYSTEM", "Bot tetap berjalan...");
+  });
 
-        if (qr) {
-            console.log("📱 Scan QR:");
-            qrcode.generate(qr, { small: true });
+  process.on("warning", (warning) => {
+    logger.warn("SYSTEM", `${warning.name}: ${warning.message}`);
+  });
+
+  process.on("SIGINT", () => {
+    console.log("");
+    logger.system("SYSTEM", "SIGINT diterima");
+    logger.info("DATABASE", "Menyimpan data...");
+    try {
+      const db = getDatabase();
+      db.save();
+      logger.success("DATABASE", "Data tersimpan");
+    } catch (error) {
+      logger.warn("DATABASE", `Gagal menyimpan: ${error.message}`);
+    }
+    logger.info("SYSTEM", "Bot dihentikan");
+    process.exit(0);
+  });
+
+  process.on("SIGTERM", () => {
+    console.log("");
+    logger.system("SYSTEM", "SIGTERM diterima");
+    process.exit(0);
+  });
+
+  logger.success("SYSTEM", "Anti-crash aktif");
+}
+
+async function main() {
+  printBanner();
+  printStartup({
+    name: config.bot?.name || "Ourin-AI",
+    version: config.bot?.version || "1.0.0",
+    developer: config.bot?.developer || "Developer",
+    mode: config.mode || "public"
+  });
+  setupAntiCrash();
+  divider();
+
+  logger.info("DATABASE", "Memuat database...");
+  const dbPath = path.join(process.cwd(), config.database?.path || "./database/main");
+  await initDatabase(dbPath);
+  logger.success("DATABASE", "Database siap");
+
+  const db = getDatabase();
+  const savedMode = db.setting("botMode");
+  if (savedMode && (savedMode === "self" || savedMode === "public")) {
+    config.mode = savedMode;
+    logger.info("MODE", `Mode bot: ${savedMode}`);
+  }
+  const savedPremium = db.setting("premiumUsers");
+  if (Array.isArray(savedPremium)) {
+    config.premiumUsers = savedPremium;
+    logger.info("PREMIUM", `${savedPremium.length} user premium dimuat`);
+  }
+  const savedBanned = db.setting("bannedUsers");
+  if (Array.isArray(savedBanned)) {
+    config.bannedUsers = savedBanned;
+    logger.info("BANNED", `${savedBanned.length} user banned dimuat`);
+  }
+
+  if (config.backup?.enabled !== false) startAutoBackup(dbPath);
+
+  const pluginsPath = path.join(process.cwd(), "plugins");
+  const pluginCount = loadPlugins(pluginsPath);
+  logger.success("PLUGINS", `${pluginCount} plugin dimuat`);
+  logger.success("CASE", "Case handler aktif");
+
+  if (config.dev?.enabled && config.dev?.watchPlugins) startDevWatcher(pluginsPath);
+  if (config.dev?.enabled && config.dev?.watchSrc) {
+    const srcPath = path.join(process.cwd(), "src");
+    startSrcWatcher(srcPath);
+  }
+
+  initScheduler(config);
+  logger.success("SCHEDULE", "Scheduler siap");
+
+  const bootTime = Date.now() - startTime;
+  logger.success("BOOT", `Selesai dalam ${bootTime}ms`);
+  divider();
+  logger.info("WA", "Menghubungkan ke WhatsApp...");
+  console.log("");
+
+  await startConnection({
+    onRawMessage: async (msg, sock) => {
+      try {
+        const db = getDatabase();
+        await handleAntiTagSW(msg, sock, db);
+      } catch (error) { }
+    },
+
+    onMessage: async (msg, sock) => {
+      try {
+        const db = getDatabase()
+        const handled = await autoLinkHandler(msg, { sock, db })
+        if (handled) return;
+        const handlerPromise = messageHandler(msg, sock);
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Handler timeout")), 60000)
+        );
+        await Promise.race([handlerPromise, timeoutPromise]);
+      } catch (error) {
+        if (error.message !== "Handler timeout") {
+          logger.error("HANDLER", error.message);
+          if (config.dev?.debugLog) console.error(c.gray(error.stack));
         }
+      }
+    },
 
-        if (connection === "open") {
-            console.log("✅ WhatsApp CONNECTED");
-        }
+    onGroupUpdate: async (update, sock) => {
+      try {
+        await groupHandler(update, sock);
+      } catch (error) {
+        logger.error("GROUP", error.message);
+      }
+    },
 
-        if (connection === "close") {
-            const reason = lastDisconnect?.error?.output?.statusCode;
-            if (reason !== DisconnectReason.loggedOut) {
-                console.log("🔄 Reconnecting...");
-                startBot();
-            } else {
-                console.log("🚫 Logged out. Hapus auth_info_baileys lalu scan ulang.");
-            }
-        }
-    });
-    sock.ev.on("messages.upsert", async ({ messages }) => {
+    onMessageUpdate: async (updates, sock) => {
+      try {
+        await messageUpdateHandler(updates, sock);
+      } catch (error) {
+        logger.error("MSG", error.message);
+      }
+    },
+
+    onGroupSettingsUpdate: async (update, sock) => {
+      try {
+        await groupSettingsHandler(update, sock);
+      } catch (error) {
+        logger.error("GROUP", error.message);
+      }
+    },
+
+    onConnectionUpdate: async (update, sock) => {
+      // FIX: Baris "if (update.connection === "open") { loadmodule(sock);" dihapus
+      // loadmodule tidak terdefinisi — diganti dengan blok if yang benar
+      if (update.connection === "open") {
+        logConnection("connected", sock.user?.name || "Bot");
+        logger.success("READY", "Bot siap menerima pesan!");
+        loadScheduledMessages(sock);
+        startGroupScheduleChecker(sock);
+        startSewaChecker(sock);
+        initScheduler(config, sock);
+        initAutoJpmScheduler(sock);
+        initSholatScheduler(sock);
+
         try {
-            const fs = require("fs")
-
-            function autoDelete(filePath, hours = 24) {
-                const fs = require("fs")
-
-                const delay = hours * 60 * 60 * 1000 // 24 jam
-
-                setTimeout(() => {
-                    fs.unlink(filePath, err => {
-                        if (err) {
-                            console.error("[AUTO DELETE] Gagal:", err.message)
-                        } else {
-                            console.log("[AUTO DELETE] File dihapus:", filePath)
-                        }
-                    })
-                }, delay)
-            }
-
-            if (!messages || !messages[0]) return
-            const m = messages[0]
-            if (!m.message) return
-            if (m.key.fromMe) return
-
-            const OWNER_NUMBER = "6282146731108"
-
-            const sender = m.key.remoteJid || ""
-
-            const isGroup = sender.endsWith("@g.us")
-
-            const senderNumber = isGroup
-                ? (m.key.participant || "")
-                : sender
-
-            // Bersihkan jadi angka (ANTI NULL ERROR)
-            const senderClean = senderNumber
-                ? senderNumber.replace(/[^0-9]/g, "")
-                : ""
-
-            const isOwner = senderClean === OWNER_NUMBER
-
-            const reply = (text) =>
-                sock.sendMessage(sender, { text }, { quoted: m })
-
-            const react = (emoji) =>
-                sock.sendMessage(sender, {
-                    react: { text: emoji, key: m.key }
-                })
-
-            const msg = m.message || {}
-
-            const text =
-                msg?.conversation ||
-                msg?.extendedTextMessage?.text ||
-                msg?.imageMessage?.caption ||
-                msg?.videoMessage?.caption ||
-                ""
-
-            const args = text.trim().split(/\s+/)
-            const command = args[0]?.toLowerCase() || ""
-
-            const rawText = args.slice(1).join(" ").trim()
-
-            // ===== WAJIB ADA =====
-            let stickerText = rawText
-            // === setelah command & rawText didapat ===
-            let topText = ""
-            let bottomText = ""
-
-            // 🔥 PRIORITAS: keyword eksplisit
-            if (rawText.startsWith("atas|")) {
-                topText = rawText.replace(/^atas\|/i, "").trim()
-                bottomText = ""
-            }
-            else if (rawText.startsWith("bawah|")) {
-                topText = ""
-                bottomText = rawText.replace(/^bawah\|/i, "").trim()
-            }
-
-            // 🔁 format umum pakai |
-            else if (rawText.includes("|")) {
-                const [atas, ...bawah] = rawText.split("|")
-                topText = atas.trim()
-                bottomText = bawah.join("|").trim()
-            }
-
-            // 🔥 DEFAULT → teks di BAWAH
-            else {
-                topText = ""
-                bottomText = rawText.trim()
-            }
-
-            // 🛡️ safety anti double
-            if (topText === bottomText) {
-                topText = ""
-            }
-            const quoted =
-                m.message?.extendedTextMessage?.contextInfo?.quotedMessage || null
-
-            // 🔹 URL untuk command (.ytv, .yta, .mirror)
-            let url = null
-            if (args[1]?.startsWith("http")) {
-                url = args[1]
-            }
-
-            // 🔹 URL tanpa prefix (auto download)
-            const autoUrl = extractUrlFromText(text)
-
-            // 🔹 URL final untuk deteksi platform
-            const finalUrl = url || autoUrl
-
-            // ===============================
-            // MEDIA CONTEXT
-            // ===============================
-            const imageMessage =
-                m.message?.imageMessage ||
-                m.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage ||
-                quoted?.imageMessage ||
-                null
-
-            const videoMessage =
-                m.message?.videoMessage ||
-                m.message?.extendedTextMessage?.contextInfo?.quotedMessage?.videoMessage ||
-                quoted?.videoMessage ||
-                null
-
-            const hasImage = !!imageMessage
-            const hasVideo = !!videoMessage
-            const videoDuration = videoMessage?.seconds || 0
-
-            // ===============================
-            // FLAGS
-            // ===============================
-            const isCommand = text.startsWith(".")
-
-            function pickMainVideo(files) {
-                const videos = files.filter(f => isVideo(f))
-                if (videos.length <= 1) return videos
-
-                return [
-                    videos.sort((a, b) =>
-                        fs.statSync(b).size - fs.statSync(a).size
-                    )[0]
-                ]
-            }
-            function detectSource(finalUrl) {
-                if (/drive\.google\.com|drive\.usercontent\.google\.com/.test(finalUrl)) {
-                    return "gdrive"
-                }
-                if (/pixeldrain\.com/.test(finalUrl)) {
-                    return "pixeldrain"
-                }
-                return "direct"
-            }
-            function normalizeDriveUrl(finalUrl) {
-                // drive.usercontent.google.com → drive.google.com/uc
-                if (finalUrl.includes("drive.usercontent.google.com")) {
-                    const u = new URL(finalUrl)
-                    const id = u.searchParams.get("id")
-                    if (id) return `https://drive.google.com/uc?id=${id}`
-                }
-
-                // drive.google.com/file/d/ID/view → uc?id=ID
-                const match = finalUrl.match(/\/file\/d\/([a-zA-Z0-9_-]+)/)
-                if (match) {
-                    return `https://drive.google.com/uc?id=${match[1]}`
-                }
-
-                return finalUrl
-            }
-            function parseAriaProgress(line) {
-                // contoh:
-                // [#1f3a 45MiB/100MiB(45%) CN:1 DL:3.2MiB ETA:17s]
-                const percent = line.match(/(\d+)%/)
-                const speed = line.match(/DL:([\d.]+[KMG]iB)/)
-                const eta = line.match(/ETA:([0-9a-zA-Z]+)/)
-
-                return percent ? {
-                    percent: percent[1],
-                    speed: speed ? speed[1] : "-",
-                    eta: eta ? eta[1] : "-"
-                } : null
-            }
-            function parseGdownProgress(line) {
-                const m = line.match(/(\d+)%/)
-                return m ? m[1] : null
-            }
-            function progressBar(p) {
-                const total = 10
-                const filled = Math.round((p / 100) * total)
-                return "█".repeat(filled) + "░".repeat(total - filled)
-            }
-            function extractHttpUrl(text) {
-                const match = text.match(/https?:\/\/[^\s]+/i)
-                return match ? match[0] : null
-            }
-            function formatRemaining(ms) {
-                const h = Math.floor(ms / (1000 * 60 * 60))
-                const m = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60))
-                return `${h} jam ${m} menit`
-            }
-            function getExpireInfo(filePath, hours = 24) {
-                const fs = require("fs")
-                if (!fs.existsSync(filePath)) return null
-
-                const stat = fs.statSync(filePath)
-                const expireAt = stat.mtimeMs + hours * 60 * 60 * 1000
-                const remain = expireAt - Date.now()
-
-                if (remain <= 0) return { expired: true }
-
-                return {
-                    expired: false,
-                    remain,
-                    expireAt
-                }
-            }
-            function detectPlatform(url) {
-                if (/youtube\.com|youtu\.be/.test(url)) return "youtube"
-                if (/tiktok\.com/.test(url)) return "tiktok"
-                if (/instagram\.com/.test(url)) return "instagram"
-                if (/twitter\.com|x\.com/.test(url)) return "twitter"
-                if (/facebook\.com|fb\.watch/.test(url)) return "facebook"
-                return "generic"
-            }
-            // ===============================
-            // ⚡ UPLOAD CONFIG
-            // ===============================
-            const MAX_PARALLEL_UPLOAD = 2
-
-            function parseYtDlpProgress(line) {
-                // contoh:
-                // [download]  45.3% of 10.23MiB at 2.31MiB/s ETA 00:08
-                const percent = line.match(/(\d+(?:\.\d+)?)%/)
-                const speed = line.match(/at\s+([\d.]+\w+\/s)/i)
-                const eta = line.match(/ETA\s+([0-9:]+)/i)
-
-                if (!percent) return null
-
-                return {
-                    percent: Math.floor(Number(percent[1])),
-                    speed: speed ? speed[1] : "-",
-                    eta: eta ? eta[1] : "-"
-                }
-            }
-
-            function renderBar(p) {
-                const total = 10
-                const filled = Math.round((p / 100) * total)
-                return "█".repeat(filled) + "░".repeat(total - filled)
-            }
-            function isVideo(name) {
-                return /\.(mp4|mkv|webm|mov)$/i.test(name)
-            }
-
-            function isImage(name) {
-                return /\.(jpg|jpeg|png|webp|heic)$/i.test(name)
-            }
-
-            function logWaError({ stage, file, type, sizeMB, error }) {
-                console.error("🧨 WA ERROR")
-                console.error({
-                    stage,
-                    file,
-                    type,
-                    sizeMB,
-                    error
-                })
-            }
-            function extractUrlFromText(text) {
-                const m = text.match(/https?:\/\/[^\s]+/i)
-                return m ? m[0] : null
-            }
-            function makeVideoStickerUltra(input, output, duration, cb) {
-    const safeDuration = Math.min(duration || 4, 4)
-
-    const args = [
-        "-y",
-        "-i", input,
-        "-ss", "0",
-        "-t", String(safeDuration),
-        "-vf", "scale=512:512:force_original_aspect_ratio=decrease,fps=8",
-        "-lossless", "0",
-        "-q:v", "70",
-        "-compression_level", "6",
-        "-loop", "0",
-        "-an",
-        output
-    ]
-
-    const ff = spawn("ffmpeg", args)
-
-    ff.on("error", err => cb(err))
-
-    ff.on("close", code => {
-        if (code !== 0 || !fs.existsSync(output)) {
-            return cb(new Error("ffmpeg failed"))
-        }
-        cb(null)
-    })
-}
-            // =======================
-            // Bot Mirror Link
-            // =======================
-            if (command === ".mirror" || command === ".m") {
-
-                if (!args.length) {
-                    return reply("⚠️ Format:\n.mirror <link | list | info>")
-                }
-
-                const fs = require("fs")
-                const path = require("path")
-
-                const sub = args[1]?.toLowerCase() || ""
-                const rawInput = args.slice(1).join(" ").trim()
-
-                // ======================
-                // 📂 LIST
-                // ======================
-                // ======================
-                // 🧹 CLEAR ALL MIRROR
-                // ======================
-                if (sub === "clear") {
-
-                    // if (!isOwner) {
-                    //     return reply("❌ Owner only")
-                    // }
-
-                    if (isDownloading) {
-                        return reply("⛔ Tidak bisa clear saat download sedang berlangsung.")
-                    }
-
-                    const files = fs.readdirSync(MIRROR_DIR)
-                        .filter(f => fs.statSync(path.join(MIRROR_DIR, f)).isFile())
-
-                    if (!files.length) {
-                        return reply("📂 Tidak ada file mirror untuk dihapus.")
-                    }
-
-                    // bersihkan confirm lama
-                    if (pendingClear?.timer) {
-                        clearTimeout(pendingClear.timer)
-                    }
-
-                    // auto expire 30 detik
-                    const timer = setTimeout(() => {
-                        pendingClear = null
-                    }, 30_000)
-
-                    pendingClear = {
-                        sender,
-                        count: files.length,
-                        timer
-                    }
-
-                    return reply(
-                        `⚠️ *KONFIRMASI CLEAR MIRROR*\n\n` +
-                        `📂 Total file: *${files.length}*\n\n` +
-                        `Ketik:\n` +
-                        `• *.m yes* → hapus semua\n` +
-                        `• *.m no* → batal`
-                    )
-                }
-                if (sub === "list") {
-
-                    const files = fs.readdirSync(MIRROR_DIR)
-                        .filter(f => fs.statSync(path.join(MIRROR_DIR, f)).isFile())
-
-                    if (!files.length) {
-                        return reply("📂 Tidak ada file mirror.")
-                    }
-
-                    let text = "📂 *Daftar File Mirror*\n\n"
-
-                    files.forEach((file, i) => {
-                        const info = getExpireInfo(path.join(MIRROR_DIR, file))
-                        if (!info || info.expired) return
-                        text += `${i + 1}. 📄 ${file}\n⏳ ${formatRemaining(info.remain)}\n\n`
-                    })
-
-                    return reply(text.trim())
-                }
-                // ======================
-                // ℹ️ INFO <kata>
-                // ======================
-                if (sub.startsWith("info")) {
-                    const keyword = args.slice(2).join(" ").trim()
-
-                    if (!keyword) {
-                        return reply("⚠️ Contoh:\n.mirror info img\n.mirror info ota")
-                    }
-
-                    const files = fs.readdirSync(MIRROR_DIR)
-                        .filter(f => f.toLowerCase().includes(keyword))
-
-                    if (!files.length) {
-                        return reply("❌ File tidak ditemukan.")
-                    }
-
-                    const file = files[0]
-                    const info = getExpireInfo(path.join(MIRROR_DIR, file))
-
-                    if (!info || info.expired) {
-                        return reply("⛔ File sudah expired / akan dihapus.")
-                    }
-
-                    const expireTime = new Date(info.expireAt).toLocaleString("id-ID", {
-                        timeZone: "Asia/Jakarta"
-                    })
-
-                    return reply(
-                        `📄 *File:* ${file}
-
-⏳ *Sisa waktu:* ${formatRemaining(info.remain)}
-🕒 *Expired:* ${expireTime}`
-                    )
-                }
-                // ======================
-                // 🗑️ DELETE (CONFIRM + OWNER)
-                // ======================
-                if (sub === "delete" || sub === "del") {
-
-                    // if (!isOwner) {
-                    //     return reply("❌ Owner only")
-                    // }
-                    // ⛔ BLOCK SAAT DOWNLOAD AKTIF
-                    if (isDownloading) {
-                        return reply("⛔ Tidak bisa menghapus file saat download sedang berlangsung.")
-                    }
-
-                    const target = args[2]
-                    if (!target) {
-                        return reply("⚠️ Contoh:\n.m delete 1\n.m delete test.txt")
-                    }
-
-                    const files = fs.readdirSync(MIRROR_DIR)
-                        .filter(f => fs.statSync(path.join(MIRROR_DIR, f)).isFile())
-
-                    if (!files.length) {
-                        return reply("📂 Tidak ada file.")
-                    }
-
-                    let file = null
-                    let index = null
-
-                    // 🔢 by nomor
-                    if (/^\d+$/.test(target)) {
-                        index = parseInt(target) - 1
-                        if (index < 0 || index >= files.length) {
-                            return reply("❌ Nomor tidak valid.")
-                        }
-                        file = files[index]
-                    }
-                    // 🔤 by nama
-                    else {
-                        file = files.find(f =>
-                            f.toLowerCase().includes(target.toLowerCase())
-                        )
-                        index = files.indexOf(file)
-                    }
-
-                    if (!file) {
-                        return reply("❌ File tidak ditemukan.")
-                    }
-                    // 🧹 bersihin confirm lama
-                    if (pendingDelete?.timer) {
-                        clearTimeout(pendingDelete.timer)
-                    }
-
-                    // ⏱️ AUTO EXPIRE 30 DETIK
-                    const timer = setTimeout(() => {
-                        pendingDelete = null
-                    }, 30_000)
-
-                    // simpan state confirm
-                    pendingDelete = {
-                        sender,
-                        file,
-                        index
-                    }
-
-                    return reply(
-                        `⚠️ *Konfirmasi Hapus File*\n\n` +
-                        `${index + 1}. 📄 ${file}\n\n` +
-                        `Ketik:\n` +
-                        `• *.m yes* → lanjut\n` +
-                        `• *.m no* → batal`
-                    )
-                }
-                // ======================
-                // ✅ CONFIRM DELETE
-                // ======================
-                if (sub === "yes") {
-
-                    // if (!isOwner) {
-                    //     return reply("❌ Owner only")
-                    // }
-
-                    // ======================
-                    // ✅ CONFIRM CLEAR
-                    // ======================
-                    if (pendingClear && pendingClear.sender === sender) {
-
-                        clearTimeout(pendingClear.timer)
-
-                        const files = fs.readdirSync(MIRROR_DIR)
-                            .filter(f => fs.statSync(path.join(MIRROR_DIR, f)).isFile())
-
-                        for (const f of files) {
-                            try {
-                                fs.unlinkSync(path.join(MIRROR_DIR, f))
-                            } catch (e) {
-                                console.error("[CLEAR ERROR]", e.message)
-                            }
-                        }
-
-                        const total = pendingClear.count
-                        pendingClear = null
-
-                        return reply(
-                            `🧹 *Mirror berhasil dibersihkan*\n\n` +
-                            `🗑️ ${total} file dihapus`
-                        )
-                    }
-
-                    // ======================
-                    // ✅ CONFIRM DELETE (SATU FILE)
-                    // ======================
-                    if (pendingDelete && pendingDelete.sender === sender) {
-
-                        clearTimeout(pendingDelete.timer)
-
-                        const filePath = path.join(MIRROR_DIR, pendingDelete.file)
-                        if (fs.existsSync(filePath)) {
-                            fs.unlinkSync(filePath)
-                        }
-
-                        pendingDelete = null
-                        return reply("🗑️ File berhasil dihapus.")
-                    }
-
-                    return reply("❌ Tidak ada aksi yang menunggu konfirmasi.")
-                }
-                // ======================
-                // ❌ CANCEL DELETE
-                // ======================
-                if (sub === "no") {
-
-                    // if (!isOwner) {
-                    //     return reply("❌ Owner only")
-                    // }
-
-                    if (pendingDelete?.timer) clearTimeout(pendingDelete.timer)
-                    if (pendingClear?.timer) clearTimeout(pendingClear.timer)
-
-                    pendingDelete = null
-                    pendingClear = null
-
-                    return reply("❌ Aksi dibatalkan.")
-                }
-                // ======================
-                // 🔗 LINK MIRROR (finalUrl)
-                // ======================
-                const finalUrl = extractHttpUrl(rawInput)
-
-                if (!finalUrl) {
-                    return reply("❌ Link tidak valid. Gunakan http/https.")
-                }
-
-                const source = detectSource(finalUrl)
-
-                mirrorQueue.push({
-                    finalUrl,
-                    sender,
-                    m,
-                    source
-                })
-
-                reply(
-                    `📌 Link masuk antrian!
-📥 Posisi: ${mirrorQueue.length}
-🔗 Sumber: ${source}`
-                )
-
-                processQueue(sock)
-            }
-            async function processQueue(sock) {
-                if (isDownloading || isPaused) return
-                if (!mirrorQueue.length) return
-
-                isDownloading = true
-                const job = mirrorQueue.shift()
-                const { finalUrl, sender, m, source } = job
-
-                const jobId = Date.now().toString()
-                const jobDir = path.join(MIRROR_DIR, `job_${jobId}`)
-                fs.mkdirSync(jobDir, { recursive: true })
-
-                // 📩 kirim pesan progress awal
-                const progressMsg = await sock.sendMessage(
-                    sender,
-                    { text: "📥 *Mulai download...*\n0%" },
-                    { quoted: m }
-                )
-
-                const progressKey = progressMsg.key
-                let lastProgress = -1
-                let proc
-
-                // ======================
-                // 📦 GOOGLE DRIVE
-                // ======================
-                if (source === "gdrive") {
-                    const driveUrl = normalizeDriveUrl(finalUrl)
-                    console.log("[GDRIVE] finalUrl:", driveUrl)
-
-                    proc = spawn("gdown", ["--fuzzy", driveUrl], { cwd: jobDir })
-
-                    proc.stderr.on("data", async d => {
-                        const line = d.toString()
-                        const p = parseGdownProgress(line)
-
-                        if (p && p !== lastProgress) {
-                            lastProgress = p
-                            const bar = progressBar(p)
-
-                            await editMessage(
-                                sock,
-                                sender,
-                                progressKey,
-                                `📥 *Downloading (Google Drive)*
-
-[${bar}] ${p}%
-
-⚠️ ETA tidak tersedia`
-                            ).catch(() => { })
-                        }
-                    })
-
-                    proc.stderr.on("data", d => {
-                        console.error("[GDOWN]", d.toString().trim())
-                    })
-                }
-
-                // ======================
-                // 🌐 DIRECT / ARIA2
-                // ======================
-                else {
-                    proc = spawn("aria2c", [
-                        "--user-agent=Mozilla/5.0",
-                        "--summary-interval=1",
-                        "--file-allocation=trunc",
-                        "--auto-file-renaming=false",
-                        "--allow-overwrite=true",
-                        "--dir", jobDir,
-                        finalUrl
-                    ])
-
-                    proc.stderr.on("data", async d => {
-                        const line = d.toString()
-                        const info = parseAriaProgress(line)
-
-                        if (info && info.percent !== lastProgress) {
-                            lastProgress = info.percent
-
-                            const bar = progressBar(info.percent)
-
-                            const text =
-                                `📥 *Downloading...*
-
-[${bar}] ${info.percent}%
-
-⚡ Speed : ${info.speed}
-⏱️ ETA   : ${info.eta}`
-
-                            await editMessage(sock, sender, progressKey, text)
-                                .catch(() => { })
-                        }
-                    })
-
-                    proc.stderr.on("data", d => {
-                        console.error("[ARIA2]", d.toString().trim())
-                    })
-                }
-
-                // 🔄 reaction tiap 10 detik
-                const reactInterval = setInterval(() => {
-                    sock.sendMessage(sender, {
-                        react: { text: "🔄", key: m.key }
-                    }).catch(() => { })
-                }, 10000)
-
-                // ======================
-                // ✅ SELESAI
-                // ======================
-                proc.on("close", async () => {
-                    clearInterval(reactInterval)
-                    isDownloading = false
-
-                    const files = fs.readdirSync(jobDir).filter(f => !f.endsWith(".part"))
-
-                    if (!files.length) {
-                        await editMessage(
-                            sock,
-                            sender,
-                            progressKey,
-                            "❌ *Download gagal*"
-                        ).catch(() => { })
-
-                        return processQueue(sock)
-                    }
-
-                    const filename = files[0]
-                    const finalPath = path.join(MIRROR_DIR, filename)
-                    fs.renameSync(path.join(jobDir, filename), finalPath)
-
-                    await editMessage(
-                        sock,
-                        sender,
-                        progressKey,
-                        `✅ *Download selesai!*\n\n📄 ${filename}`
-                    ).catch(() => { })
-
-                    await sock.sendMessage(sender, {
-                        text:
-                            `📦 *Mirror siap*\n\n` +
-                            `📄 ${filename}\n` +
-                            `🔗 ${DOMAIN}/${filename}`
-                    }, { quoted: m })
-
-                    autoDelete(finalPath)
-                    processQueue(sock)
-                })
-            }
-            // =======================
-            // QC FINAL STABLE
-            // =======================
-            if (command === ".qc") {
-
-                const quoted = m.message.extendedTextMessage?.contextInfo
-
-                if (!quoted?.quotedMessage) {
-                    return reply("⚠️ Reply pesan yang ingin dijadikan sticker.")
-                }
-
-                await react("⏳")
-
-                const quotedMsg = quoted.quotedMessage
-                const senderJid = quoted.participant || sender
-
-                // ===== SENSOR NOMOR =====
-                let rawNumber = senderJid.split("@")[0]
-                const maskNumber = (num) => {
-                    if (num.length <= 8) return num
-                    return num.slice(0, 5) + "****" + num.slice(-3)
-                }
-                const senderName = maskNumber(rawNumber)
-
-                // ===== AMBIL TEKS =====
-                let quotedText = "Pesan tidak didukung"
-
-                if (quotedMsg.conversation) {
-                    quotedText = quotedMsg.conversation
-                } else if (quotedMsg.extendedTextMessage?.text) {
-                    quotedText = quotedMsg.extendedTextMessage.text
-                } else if (quotedMsg.imageMessage?.caption) {
-                    quotedText = quotedMsg.imageMessage.caption
-                } else if (quotedMsg.videoMessage?.caption) {
-                    quotedText = quotedMsg.videoMessage.caption
-                } else if (quotedMsg.stickerMessage) {
-                    quotedText = "🖼️ Sticker"
-                }
-
-                // ===== ESCAPE HTML =====
-                const escapeHTML = (text) => {
-                    return text
-                        .replace(/&/g, "&amp;")
-                        .replace(/</g, "&lt;")
-                        .replace(/>/g, "&gt;")
-                        .replace(/"/g, "&quot;")
-                }
-
-                // ===== AMBIL FOTO PROFILE =====
-                let profilePic
-                try {
-                    profilePic = await sock.profilePictureUrl(senderJid, "image")
-                } catch {
-                    profilePic = "https://i.ibb.co/6bQXQ9Q/user.png"
-                }
-
-                const time = new Date().toLocaleTimeString("id-ID", {
-                    hour: "2-digit",
-                    minute: "2-digit"
-                })
-
-                const browser = await puppeteer.launch({
-                    headless: "new",
-                    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-                })
-
-                const page = await browser.newPage()
-
-                const html = `
-    <html>
-    <head>
-    <style>
-    body {
-        margin:0;
-        background:transparent;
-        font-family:
-        "Noto Color Emoji",
-        "Apple Color Emoji",
-        "Segoe UI Emoji",
-        system-ui,
-        sans-serif;
-        display:flex;
-        justify-content:center;
-        align-items:center;
-        height:100vh;
-    }
-    .chat {
-        display:flex;
-        align-items:flex-start;
-        gap:20px;
-        padding:40px;
-    }
-    .avatar {
-        width:90px;
-        height:90px;
-        border-radius:50%;
-        background-image:url('${profilePic}');
-        background-size:cover;
-        background-topText:center;
-    }
-    .bubble-container {
-        display:flex;
-        flex-direction:column;
-    }
-    .name {
-        color:#00a884;
-        font-size:30px;
-        font-weight:600;
-        margin-bottom:10px;
-    }
-    .bubble {
-        background:#202c33;
-        color:white;
-        padding:25px 30px;
-        border-radius:18px;
-        max-width:650px;
-        font-size:34px;
-        line-height:1.4;
-        word-wrap:break-word;
-    }
-    .meta {
-        font-size:20px;
-        color:#8696a0;
-        margin-top:8px;
-        text-align:right;
-    }
-    </style>
-    </head>
-    <body>
-        <div class="chat">
-            <div class="avatar"></div>
-            <div class="bubble-container">
-                <div class="name">${senderName}</div>
-                <div class="bubble">${escapeHTML(quotedText)}</div>
-                <div class="meta">${time}</div>
-            </div>
-        </div>
-    </body>
-    </html>
-    `
-
-                await page.setViewport({
-                    width: 1000,
-                    height: 1000,
-                    deviceScaleFactor: 2
-                })
-
-                await page.setContent(html)
-
-                const screenshot = await page.screenshot({
-                    type: "png",
-                    omitBackground: true
-                })
-
-                await browser.close()
-                const webpBuffer = await sharp(screenshot)
-                    .resize(512, 512, {
-                        fit: "cover",
-                        background: { r: 0, g: 0, b: 0, alpha: 0 }
-                    })
-                    .webp({
-    quality: 70,
-    effort: 6
-})
-                    .toBuffer()
-                const sticker = new Sticker(webpBuffer, {
-                    pack: "KepoBot",
-                    author: "Balerina",
-                    type: "full",
-                    quality: 70
-                })
-
-                await sock.sendMessage(sender, {
-                    sticker: await sticker.toBuffer()
-                }, { quoted: m })
-
-                await react("✅")
-            }
-            //   convert sticker to image handler
-            const getQuotedSticker = (m) => {
-                const ctx = m.message?.extendedTextMessage?.contextInfo
-                if (!ctx?.quotedMessage) return null
-                return ctx.quotedMessage.stickerMessage || null
-            }
-            // sticker to image handler (PRIORITAS 2)
-            if (command === ".sf") {
-                const stickerMsg = getQuotedSticker(m)
-                if (!stickerMsg) return reply("❌ Reply stickernya")
-
-                await react("⏳")
-                fs.mkdirSync("./tmp", { recursive: true })
-
-                const base = `./tmp/${Date.now()}`
-                const webpPath = `${base}.webp`
-                const pngPath = `${base}.png`
-                const mp4Path = `${base}.mp4`
-
-                try {
-                    // download sticker
-                    const stream = await downloadContentFromMessage(stickerMsg, "sticker")
-                    let buffer = Buffer.from([])
-                    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk])
-                    fs.writeFileSync(webpPath, buffer)
-
-                    // ===============================
-                    // 🔍 CEK FRAME COUNT (OPSIONAL)
-                    // ===============================
-                    let frameCount = 1
-                    try {
-                        const out = execSync(`identify "${webpPath}"`).toString()
-                        frameCount = out.split("\n").length
-                    } catch { }
-
-                    const isAnimated = frameCount > 1
-
-                    // ===============================
-                    // 🎞️ ANIMATED → VIDEO LOOP (PAKSA)
-                    // ===============================
-                    if (isAnimated) {
-                        // ambil frame pertama saja
-                        await sharp(buffer)
-                            .resize(512, 512, { fit: "contain" })
-                            .png()
-                            .toFile(pngPath)
-
-                        // bikin video loop dari image
-                        exec(
-                            `ffmpeg -y -loop 1 -i "${pngPath}" -t 2 \
--vf "zoompan=z='min(zoom+0.001,1.05)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=60,scale=512:-2" \
--pix_fmt yuv420p "${mp4Path}"`,
-                            async () => {
-
-                                if (!fs.existsSync(mp4Path)) {
-                                    await react("❌")
-                                    return reply("❌ Gagal membuat video")
-                                }
-
-                                await sock.sendMessage(
-                                    sender,
-                                    {
-                                        video: fs.readFileSync(mp4Path),
-                                        caption: "🎥 sticker → video"
-                                    },
-                                    { quoted: m }
-                                )
-
-                                cleanup()
-                                await react("✅")
-                            }
-                        )
-                        return
-                    }
-
-                    // ===============================
-                    // 🖼️ STATIC → FOTO
-                    // ===============================
-                    const imageBuffer = await sharp(buffer)
-                        .resize(2048, 2048, {
-                            fit: "contain",
-                            background: { r: 255, g: 255, b: 255, alpha: 1 }
-                        })
-                        .png()
-                        .toBuffer()
-
-                    await sock.sendMessage(
-                        sender,
-                        {
-                            image: imageBuffer,
-                            caption: "🖼️ sticker → foto"
-                        },
-                        { quoted: m }
-                    )
-
-                    cleanup()
-                    await react("✅")
-
-                } catch (err) {
-                    console.error(err)
-                    cleanup()
-                    await react("❌")
-                    reply("❌ Gagal memproses sticker")
-                }
-
-                function cleanup() {
-                    try {
-                        if (fs.existsSync(webpPath)) fs.unlinkSync(webpPath)
-                        if (fs.existsSync(pngPath)) fs.unlinkSync(pngPath)
-                        if (fs.existsSync(mp4Path)) fs.unlinkSync(mp4Path)
-                    } catch { }
-                }
-            }
-            // end of sticker text logic
-            // ================= STICKER FOTO =================
-            if ((command === ".sticker" || command === ".s") && hasImage) {
-
-                if (!imageMessage) {
-                    return reply(
-                        "❌ Kirim atau reply gambar\n\n" +
-                        ".s bawah|contoh sticker 😏🎵"
-                    )
-                }
-
-                await react("⏳")
-
-                const stream = await downloadContentFromMessage(imageMessage, "image")
-                let buffer = Buffer.from([])
-
-                for await (const chunk of stream) {
-                    buffer = Buffer.concat([buffer, chunk])
-                }
-
-                let image = sharp(buffer).resize(512, 512, {
-                    fit: "contain",
-                    background: { r: 0, g: 0, b: 0, alpha: 0 }
-                })
-
-                if (stickerText) {
-                    const svg = buildStickerSvg(topText, bottomText)
-                    image = image.composite([{ input: Buffer.from(svg) }])
-                }
-
-                const webp = await image
-                    .webp({ quality: 95, effort: 6 })
-                    .toBuffer()
-
-                const sticker = new Sticker(webp, {
-                    pack: "KepoBot",
-                    author: "Balerina"
-                })
-
-                await sock.sendMessage(
-                    sender,
-                    { sticker: await sticker.toBuffer() },
-                    { quoted: m }
-                )
-                return react("✅")
-            }
-            // ================= STICKER VIDEO =================
-            if ((command === ".sticker" || command === ".s") && hasVideo) {
-
-    if (!videoMessage) {
-        await react("❌")
-        return reply("❌ Reply video untuk dijadikan sticker")
-    }
-
-    await react("⏳")
-
-    const stream = await downloadContentFromMessage(videoMessage, "video")
-    let buffer = Buffer.from([])
-    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk])
-
-    const input = `input_${Date.now()}.mp4`
-    const output = `sticker_${Date.now()}.webp`
-    fs.writeFileSync(input, buffer)
-
-    makeVideoStickerUltra(input, output, videoDuration, async (err) => {
-        if (err) {
-            fs.unlinkSync(input)
-            await react("❌")
-            return reply("❌ Gagal membuat sticker")
+          const { initSahurCron } = require('./plugins/religi/autosahur');
+          initSahurCron(sock);
+        } catch (e) {
+          logger.error('AutoSahur', `Failed to init: ${e.message}`);
         }
 
-        const sticker = new Sticker(fs.readFileSync(output), {
-            pack: "KepoBot",
-            author: "Balerina"
-        })
+        try {
+          if (startOrderPoller) startOrderPoller(sock);
+        } catch { }
 
-        await sock.sendMessage(sender, {
-            sticker: await sticker.toBuffer()
-        }, { quoted: m })
-
-        fs.unlinkSync(input)
-        fs.unlinkSync(output)
-        await react("✅")
-    })
-
-    return
-}
-
-
-            
-            // ================= WARNING .DL =================
-            // if (command.startsWith(".dl")) {
-            //     return reply("⚠️ Langsung kirimkan link saja tanpa menggunakan *.dl*")
-            // }
-
-            // =================================
-            // UNIVERSAL AUDIO CONVERTER
-            // COMMAND: .mp3 / .toa
-            // =================================
-            if (command === ".mp3" || command === ".toa") {
-
-                await react("⏳")
-
-                const timestamp = Date.now()
-                const audioPath = `audio_${timestamp}.mp3`
-
-                // ===============================
-                // 1️⃣ PRIORITAS: REPLY VIDEO
-                // ===============================
-                const quotedVideo =
-                    m.message?.extendedTextMessage?.contextInfo?.quotedMessage?.videoMessage
-
-                if (quotedVideo) {
-                    try {
-                        const stream = await downloadContentFromMessage(
-                            quotedVideo,
-                            "video"
-                        )
-
-                        const videoPath = `video_${timestamp}.mp4`
-                        const buffer = []
-
-                        for await (const chunk of stream) buffer.push(chunk)
-                        fs.writeFileSync(videoPath, Buffer.concat(buffer))
-
-                        exec(
-                            `ffmpeg -y -i "${videoPath}" -vn -ab 128k -ar 44100 "${audioPath}"`,
-                            async (err) => {
-
-                                fs.unlinkSync(videoPath)
-
-                                if (err || !fs.existsSync(audioPath)) {
-                                    await react("❌")
-                                    return reply("❌ Gagal convert video ke audio")
-                                }
-
-                                await sock.sendMessage(sender, {
-                                    audio: { url: path.resolve(audioPath) },
-                                    mimetype: "audio/mpeg",
-                                    ptt: false
-                                }, { quoted: m })
-
-                                fs.unlinkSync(audioPath)
-                                await react("✅")
-                            }
-                        )
-
-                    } catch (e) {
-                        console.error("TOA ERROR:", e)
-                        await react("❌")
-                    }
-
-                    return
-                }
-
-                // ===============================
-                // 2️⃣ LINK (YT / TT / DLL)
-                // ===============================
-                if (!finalUrl) {
-                    await react("❌")
-                    return reply("❌ Kirim link atau reply video")
-                }
-
-                exec(
-                    `yt-dlp \
---user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
--x --audio-format mp3 --audio-quality 0 \
--o "audio_${timestamp}.%(ext)s" "${finalUrl}"`,
-                    async (err) => {
-
-                        if (err || !fs.existsSync(audioPath)) {
-                            console.error("MP3 ERROR:", err)
-                            await react("❌")
-                            return reply("❌ Gagal download audio")
-                        }
-
-                        await sock.sendMessage(sender, {
-                            audio: { url: path.resolve(audioPath) },
-                            mimetype: "audio/mpeg",
-                            ptt: false
-                        }, { quoted: m })
-
-                        fs.unlinkSync(audioPath)
-                        await react("✅")
-                    }
-                )
-
-                return
+        try {
+          const { getAllJadibotSessions, restartJadibotSession } = require('./src/lib/jadibotManager');
+          const sessions = getAllJadibotSessions();
+          if (sessions.length > 0) {
+            logger.info('JADIBOT', `Memulihkan ${sessions.length} sesi...`);
+            for (const session of sessions) {
+              await restartJadibotSession(sock, session.id);
             }
-            // ======================================
-            // PREMIUM TELEGRAM STYLE MENU
-            // ======================================
-            if (command === ".menu") {
-
-                await react("📋")
-
-                const uptime = process.uptime()
-                const runtime = `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${Math.floor(uptime % 60)}s`
-
-                const menuText = `
-╭━━━〔 🤖 KEPO BOT 〕━━━⬣
-┃ 🟢 Status : Online
-┃ ⏳ Runtime : ${runtime}
-╰━━━━━━━━━━━━━━━━━━⬣
-
-╭━━━〔 📥 DOWNLOAD 〕━━━⬣
-┃ 🔹  <link> untuk download video dari media sosial
-┃ 🔹 .toa <reply> mengubah video menjadi audio
-┃ 🔹 .tomp3  <reply> mengubah video tiktok jadi audio
-┃ 🔹 .sf untuk mengubah sticker menjadi foto
-┃ 🔹 .m untuk mirror link
-╰━━━━━━━━━━━━━━━━━━⬣
-`
-
-                await sock.sendMessage(sender, {
-                    text: menuText
-                }, { quoted: m })
-
-                await react("✅")
-            }
-            // ======================================
-            // .restart (OWNER ONLY + CONFIRM)
-            // ======================================
-            if (command === ".restart") {
-
-                if (!isOwner) {
-                    return sock.sendMessage(sender, {
-                        text: `❌ Akses ditolak.\nNomor kamu: ${senderClean}`
-                    }, { quoted: m })
-                }
-
-                await sock.sendMessage(sender, {
-                    text: `
-╭───〔 🔄 RESTART BOT 〕
-│ Owner : ${senderClean}
-│ Status : Confirmed
-╰──────────────────
-Bot sedang direstart via PM2...
-`
-                }, { quoted: m })
-
-                exec("pm2 restart wa-sticker", (err, stdout, stderr) => {
-                    if (err) {
-                        console.log("Restart error:", err)
-                    } else {
-                        console.log("PM2 Restarted")
-                    }
-                })
-
-                return
-            }
-            // ======================================
-            // 🌍 UNIVERSAL MEDIA (VIDEO + FOTO)
-            // GROUPING ALBUM + /tmp SAFE
-            // ======================================
-            if (autoUrl && !isCommand) {
-
-                await react("📥")
-
-                const queueMsg = await sock.sendMessage(sender, {
-                    text: `📌 *Masuk antrian*\n📥 Posisi: ${downloadQueue.length}`
-                }, { quoted: m })
-
-                downloadQueue.push({
-                    sender,
-                    m,
-                    url: finalUrl,
-                    queueKey: queueMsg.key // 🔑 SIMPAN KEY
-                })
-                processGlobalQueue(sock)
-                return
-            }
-
-            async function processGlobalQueue(sock) {
-                if (isProcessingQueue) return
-                if (!downloadQueue.length) return
-
-                isProcessingQueue = true
-
-                const job = downloadQueue.shift()
-                const { sender, m, url, queueKey } = job
-
-                const platform = detectPlatform(url)
-                const TMP_DIR = `/tmp/wa_${Date.now()}`
-                fs.mkdirSync(TMP_DIR, { recursive: true })
-
-                const output = `${TMP_DIR}/media_%03d.%(ext)s`
-                let lastProgress = -1
-
-                try {
-                    await setReact(sock, m, "⬇️")
-
-                    if (queueKey) {
-                        await editMessage(
-                            sock,
-                            sender,
-                            queueKey,
-                            "⬇️ *Downloading media...*\n░░░░░░░░░░ 0%"
-                        ).catch(() => { })
-                    }
-
-                    // ===============================
-                    // 🍪 YOUTUBE COOKIES
-                    // ===============================
-                    const COOKIE_DIR = path.join(process.cwd(), "cookies")
-                    const YT_COOKIE_FILE = path.join(COOKIE_DIR, "youtube_cookies.txt")
-
-                    const ytCookiesArgs =
-                        platform === "youtube" && fs.existsSync(YT_COOKIE_FILE)
-                            ? ["--cookies", YT_COOKIE_FILE]
-                            : []
-
-                    // ===============================
-                    // ⬇️ yt-dlp (NO -f best ❗)
-                    // ===============================
-                    const proc = spawn("yt-dlp", [
-                        "--newline",
-
-                        "--user-agent",
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-
-                        "--no-playlist",
-                        "--ignore-errors",
-                        "--no-abort-on-error",
-
-                        "--merge-output-format", "mp4",
-
-                        ...ytCookiesArgs,
-
-                        ...(platform === "tiktok"
-                            ? ["--referer", "https://www.tiktok.com/"]
-                            : []),
-
-                        "-o", output,
-                        url
-                    ])
-
-                    proc.stdout.on("data", async d => {
-                        const line = d.toString()
-                        const info = parseYtDlpProgress(line)
-                        if (!info) return
-                        if (info.percent === lastProgress) return
-                        lastProgress = info.percent
-
-                        const bar = renderBar(info.percent)
-
-                        if (queueKey) {
-                            await editMessage(
-                                sock,
-                                sender,
-                                queueKey,
-                                `⬇️ *Downloading media...*\n` +
-                                `${bar} ${info.percent}%\n\n` +
-                                `⚡ Speed : ${info.speed}\n` +
-                                `⏱️ ETA   : ${info.eta}`
-                            ).catch(() => { })
-                        }
-                    })
-
-                    proc.stderr.on("data", d => {
-                        console.error("[YT-DLP]", d.toString().trim())
-                    })
-
-                    proc.on("close", async code => {
-                        if (code !== 0) {
-                            if (queueKey) {
-                                await editMessage(
-                                    sock,
-                                    sender,
-                                    queueKey,
-                                    "❌ *Gagal download media (YouTube proteksi)*"
-                                ).catch(() => { })
-                            }
-                            cleanup()
-                            return next()
-                        }
-
-                        // ===============================
-                        // 📂 FILE SCAN
-                        // ===============================
-                        let files = fs.readdirSync(TMP_DIR)
-                            .map(f => path.join(TMP_DIR, f))
-                            .filter(f => fs.statSync(f).isFile())
-
-                        if (!files.length) {
-                            cleanup()
-                            return next()
-                        }
-
-                        // ===============================
-                        // 🖼️ IMAGE → JPG
-                        // ===============================
-                        const normalized = []
-                        for (const f of files) {
-                            if (isImage(f) && !/\.jpe?g$/i.test(f)) {
-                                const jpg = f.replace(path.extname(f), ".jpg")
-                                await sharp(f).jpeg({ quality: 90 }).toFile(jpg)
-                                fs.unlinkSync(f)
-                                normalized.push(jpg)
-                            } else {
-                                normalized.push(f)
-                            }
-                        }
-                        files = normalized
-
-                        // ===============================
-                        // 📄 META
-                        // ===============================
-                        let caption = "📥 Media downloaded"
-                        try {
-                            const meta = JSON.parse(
-                                execSync(`yt-dlp --dump-json "${url}"`).toString()
-                            )
-                            caption =
-                                `🎵 ${meta.title || "Media"}\n` +
-                                (meta.uploader ? `👤 ${meta.uploader}` : "")
-                        } catch { }
-
-                        const images = files.filter(isImage)
-                        const videos = files.filter(isVideo)
-                        const isCarousel = files.length > 1
-
-                        await setReact(sock, m, "📤")
-
-                        if (queueKey) {
-                            await editMessage(
-                                sock,
-                                sender,
-                                queueKey,
-                                `📤 *Uploading ${isCarousel ? "carousel" : "media"}...*`
-                            ).catch(() => { })
-                        }
-
-                        // ===============================
-                        // ⚡ PARALLEL UPLOAD
-                        // ===============================
-                        const tasks = []
-
-                        images.forEach((file, i) => {
-                            tasks.push(async () => {
-                                try {
-                                    await sock.sendMessage(sender, {
-                                        image: { url: file },
-                                        caption: i === 0 ? caption : undefined
-                                    }, { quoted: m })
-                                } catch {
-                                    await sock.sendMessage(sender, {
-                                        document: { url: file },
-                                        mimetype: "image/jpeg",
-                                        fileName: path.basename(file)
-                                    }, { quoted: m })
-                                }
-                            })
-                        })
-
-                        videos.forEach((file, i) => {
-                            tasks.push(async () => {
-                                const sizeMB = fs.statSync(file).size / (1024 * 1024)
-                                if (sizeMB <= 30) {
-                                    await sock.sendMessage(sender, {
-                                        video: { url: file },
-                                        caption: images.length === 0 && i === 0 ? caption : undefined
-                                    }, { quoted: m })
-                                } else {
-                                    await sock.sendMessage(sender, {
-                                        document: { url: file },
-                                        mimetype: "video/mp4",
-                                        fileName: path.basename(file)
-                                    }, { quoted: m })
-                                }
-                            })
-                        })
-
-                        const MAX_PARALLEL_UPLOAD = 2
-                        for (let i = 0; i < tasks.length; i += MAX_PARALLEL_UPLOAD) {
-                            await Promise.all(
-                                tasks.slice(i, i + MAX_PARALLEL_UPLOAD).map(fn => fn())
-                            )
-                        }
-
-                        await setReact(sock, m, "✅")
-
-                        if (queueKey) {
-                            await editMessage(
-                                sock,
-                                sender,
-                                queueKey,
-                                "✅ *Download & upload selesai*"
-                            ).catch(() => { })
-                        }
-
-                        cleanup()
-                        next()
-                    })
-
-                } catch (e) {
-                    console.error("[QUEUE FATAL]", e)
-                    cleanup()
-                    next()
-                }
-
-                function cleanup() {
-                    try {
-                        fs.rmSync(TMP_DIR, { recursive: true, force: true })
-                    } catch { }
-                }
-
-                function next() {
-                    isProcessingQueue = false
-                    processGlobalQueue(sock)
-                }
-            }
-        } catch (err) {
-            console.error("BOT ERROR:", err)
-            try {
-                await sock.sendMessage(sender, {
-                    react: { text: "❌", key: m.key }
-                })
-                await sock.sendMessage(sender, {
-                    text: "⚠️ Terjadi kesalahan."
-                }, { quoted: m })
-            } catch { }
+          }
+        } catch (e) {
+          logger.error('JADIBOT', `Gagal memulihkan sesi: ${e.message}`);
         }
-    })
+
+        if (config.dev?.enabled) {
+          logger.info("DEV", "Mode development aktif");
+        }
+
+        divider();
+      }
+    }
+  });
 }
-startBot()
+
+main().catch((error) => {
+  logErrorBox("Fatal Error", error.message);
+  console.error(c.gray(error.stack));
+  process.exit(1);
+});
